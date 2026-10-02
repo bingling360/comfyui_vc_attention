@@ -366,18 +366,21 @@ def _prepare_fast(
     if smooth_k:
         k_t = k_t - k_t.mean(dim=1, keepdim=True)
 
-    q_codes, q_scale = _native_e4m3(q_t, dim=-1)
-    k_codes, k_scale = _native_e4m3(k_t, dim=-1)
-    q_scale = q_scale.reshape(G, n)
-    k_scale = k_scale.reshape(G, n)
-
     pad = n_pad - n
     if pad:
+        # Pad the bf16 tensors BEFORE quantisation: F.pad rejects fp8, and real
+        # packed sequences (text + audio + video) are rarely multiples of the
+        # block size — this path used to raise, get swallowed by the router,
+        # and silently disable the whole node.
+        q_t = torch.nn.functional.pad(q_t, (0, 0, 0, pad))
+        k_t = torch.nn.functional.pad(k_t, (0, 0, 0, pad))
+    q_codes, q_scale = _native_e4m3(q_t, dim=-1)
+    k_codes, k_scale = _native_e4m3(k_t, dim=-1)
+    q_scale = q_scale.reshape(G, n_pad)
+    k_scale = k_scale.reshape(G, n_pad)
+
+    if pad:
         vf = torch.nn.functional.pad(vf, (0, 0, 0, pad))
-        q_codes = torch.nn.functional.pad(q_codes, (0, 0, 0, pad))
-        k_codes = torch.nn.functional.pad(k_codes, (0, 0, 0, pad))
-        q_scale = torch.nn.functional.pad(q_scale, (0, pad))
-        k_scale = torch.nn.functional.pad(k_scale, (0, pad))
 
     vb = vf.reshape(G, nb, block_rows, d)
     mu = vb.float().mean(dim=2)                        # (G, NB, D) fp32, small
@@ -428,7 +431,10 @@ def vc_attention_triton(
                               hadamard=True, smooth_k=True)
         else:
             p = prepare(q, k, v, perm, block_rows=cfg.block_n, hadamard=True)
-        out = torch.empty_like(q)
+        # The kernel indexes Out with the padded pitch (base = bh * N_PAD * D),
+        # so the buffer must be N_PAD long, not n — a plain empty_like(q)
+        # mis-addresses every head after the first whenever n % block_rows != 0.
+        out = torch.empty((b, h, p.n_pad, d), device=q.device, dtype=q.dtype)
         grid = (triton.cdiv(p.n_pad, cfg.block_m), b * h)
         _vc_attn_fwd[grid](
             p.q, p.q_scale, p.k, p.k_scale, p.v, p.v_scale, p.mu, out,
@@ -440,7 +446,7 @@ def vc_attention_triton(
             num_warps=cfg.num_warps,
             num_stages=cfg.num_stages,
         )
-        return out
+        return out[:, :, :n]
     except Exception as e:
         # Any compile/launch problem degrades to the (slow but correct) oracle.
         # Say so loudly: a silent fallback silently voids the benchmark numbers.

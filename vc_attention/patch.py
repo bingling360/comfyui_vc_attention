@@ -39,6 +39,14 @@ __all__ = [
 ]
 
 _ORIGINALS: Dict[str, Callable] = {}
+_NOTIFIED: set = set()
+
+
+def _notify_once(msg: str) -> None:
+    """Print once per unique message; the router must fail loudly, not silently."""
+    if msg not in _NOTIFIED and len(_NOTIFIED) < 16:
+        _NOTIFIED.add(msg)
+        print(f"[VC-Attention] {msg}")
 
 # comfy >= 0.38 wraps q/k/v in single-owner containers before calling
 # optimized_attention (MiniMax-H3 does this on every call). Optional: the
@@ -161,6 +169,8 @@ class VCAttentionRuntime:
         b, h, n, d = q.shape
         if d not in cfg.supported_head_dims or n < cfg.min_tokens:
             self.stats["skipped"] += 1
+            _notify_once(f"call n={n} (head_dim={d}) below min_tokens="
+                         f"{cfg.min_tokens} -> native SDPA")
             return None
         if q.device.type != "cuda":
             self.stats["skipped"] += 1
@@ -329,9 +339,12 @@ def install(config: Optional[VCAttentionConfig] = None, model: Any = None) -> VC
                     if out is None:
                         return orig(q, k, v, heads, *args, **kwargs)
                     return out.transpose(1, 2).reshape(b, n, heads * d)
-                except Exception:
+                except Exception as e:
                     # The hook must never take sampling down with it. peek()
-                    # consumed nothing, so orig is always callable here.
+                    # consumed nothing, so orig is always callable here — but
+                    # say why, or the node looks silently inert.
+                    _notify_once(f"deferring to original attention after "
+                                 f"{type(e).__name__}: {e}")
                     return orig(q, k, v, heads, *args, **kwargs)
 
             comfy_attention.optimized_attention = hooked
