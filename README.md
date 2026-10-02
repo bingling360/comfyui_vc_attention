@@ -65,29 +65,6 @@ restore the original attention.
 Watch the console on install — it prints the detected GPU, the resolved backend
 and whether the fused kernel is actually live.
 
-### Nodes
-
-**VC Attention (MiniMax-H3)** — takes `MODEL`, returns patched `MODEL`.
-Everything defaults to the H3 distilled-LoRA setup (56 heads, head_dim 128,
-8 steps), so in the common case you only drop it in and don't touch anything.
-
-| Input | Default | Meaning |
-|---|---|---|
-| `backend` | `auto` | `nvfp4` on RTX 50xx / RTX PRO 6000, `fp8` on other fp8-capable cards, otherwise nothing runs. `reference` is the slow exact PyTorch path, for checking results. |
-| `enable_vsmooth` | on | V-Smooth value grouping — the accuracy half. Leave on. |
-| `enable_expcast` | off | ExpCast-FP8, the softmax-speed trick. Only effective when the resolved backend is `fp8` (datacenter cards). |
-| `total_steps` | 8 | Denoising steps you plan to sample with; the grouping window is derived from it. |
-| `block_rows` | 128 | Value rows per quantisation block. 128 matches H3's head_dim. |
-| `min_tokens` | 8192 | Sequences shorter than this keep native SDPA. |
-| `group_fraction` | 0.25 | Fraction of steps that run k-means grouping. |
-| `reuse_every` | 4 | Steps one permutation is reused for. |
-| `kmeans_iters` | 3 | Lloyd iterations on a cold start. |
-| `modality_aware` | off | Sort by H3 modality tag first. Measured slightly worse; kept as an option. |
-
-**VC Attention Disable** — takes and returns `MODEL`; call `uninstall()` and
-restore the original attention. Put it on a branch you don't take if you want
-the patch to last for the whole run.
-
 ## Use from Python
 
 ```python
@@ -155,15 +132,63 @@ Verified here on CPU (torch 2.14, `tests/`, 73 assertions):
 
 **Not verified — needs your GPU:**
 
-- The fused kernel body in `vc_attention/kernels/triton_attn.py`. Written
-  against the Triton FA2 shape; it has **never been compiled or run**. It is
-  guarded so any failure falls back to the reference path. Its *inputs* are
-  covered on CPU by `tests/test_prepare.py`, so a wrong result points at the
-  kernel body rather than the host-side layout. Run `tests/bench_attention.py`
-  before trusting its numbers.
-- All speed figures. Nothing here has been timed on a GPU.
+- ~~The fused kernel body in `vc_attention/kernels/triton_attn.py`~~ → **verified on an
+  RTX 4090 (Triton 3.6, torch 2.10/cu130), 2026-10-02.** It needed three fixes
+  before it produced numbers, all now in the source:
+
+  1. `LOG2E` / `P_SCALE` must be `tl.constexpr` instances — plain module
+     globals fail to compile on Triton ≥ 3.2 (`NameError` at JIT time).
+  2. The mean-restoration term was missing the `v_scale` factor:
+     `MU` stores *mean / v_scale* (as `prepare` documents), so the kernel must
+     add `r * mu * vs`, not `r * mu`. The old term drowned the output (~−40 dB).
+  3. The PV `tl.dot` runs in **bf16**, not fp8: on sm_89 + Triton 3.6, an fp8
+     MMA whose A operand was computed in registers yields NaNs in every
+     warp/stage configuration (the QK^T fp8 MMA with both operands from memory
+     is fine, as is `torch._scaled_mm`). E4M3 → bf16 is exact, so the
+     arithmetic is unchanged; the cost is half the PV MMA rate.
+
+  Verified results (identity permutation + real k-means permutation, trap armed
+  to catch silent fallback to the reference path):
+
+  | Check | Result |
+  |---|---|
+  | Kernel compiles + runs (trap did not fire) | yes |
+  | PSNR vs fp32 SDPA, 2048 i.i.d. tokens | 25.7 dB (= oracle 25.7 dB) |
+  | PSNR, bench `h3_like` data, 8192 / 16384 tokens | 58.7 / 57.8 dB |
+  | V-Smooth gain on bench structured data | +0.18 … +0.25 dB |
+  | V-Smooth gain on i.i.d. data | +0.03 dB (≈ 0, as expected) |
+  | CPU suite after the fixes | 73 / 73 assertions |
+
+  **Speed (RTX 4090, 56 heads).** The fused kernel alone runs at **0.97×
+  bf16 SDPA** (48.4 ms vs 46.9 ms at 16K tokens; best config
+  `BLOCK_M=128, num_warps=8`). The first host-side `prepare()` implementation
+  cost 201 ms per call — 4.3× the whole attention — which made end-to-end
+  0.19×. The fast path (`_prepare_fast`, used automatically on CUDA) replaces
+  the integer-op E4M3 oracle with the native `.to(float8_e4m3fn)` cast,
+  the 7-stage Hadamard butterfly with one matmul, the expanded-index gather
+  with a broadcast `take_along_dim`, and keeps the pipeline in bf16:
+  **13.8 ms, 14.5× faster, −0.10 dB PSNR.** End-to-end after integration:
+
+  | Tokens | bf16 SDPA | VC-Attention | ratio | PSNR | V-Smooth gain |
+  |---|---|---|---|---|---|
+  | 8192 | 11.6 ms | 18.7 ms | 0.62× | 58.1 dB | +0.27 dB |
+  | 16384 | 46.2 ms | 61.9 ms | 0.75× | 56.4 dB | +0.16 dB |
+  | 32768 | 188.5 ms | 224.5 ms | 0.84× | 57.8 dB | +0.11 dB |
+
+  The ratio improves with size because prepare is linear while attention is
+  quadratic — at H3's real ~50–70K-token sequences VC approaches parity, and
+  would cross over with fp8 PV (blocked by the Triton bug above), ExpCast, or
+  a tuned kernel. The k-means permutation is amortised (46 ms per step-window
+  over 50 layers at 32K tokens). A silent fallback now prints to stderr.
+
+- All speed figures besides the ones above. The paper's speedups additionally
+  rely on fp8 PV (blocked here by the Triton bug above) and ExpCast-FP8
+  (softmax-stage shortening), neither of which is active on this card.
+- ExpCast-FP8 branch: compiles (shares the fixed PV call site) but was never
+  exercised — it targets 8-bit datacenter cards.
 - Real MiniMax-H3 weights. The PSNR figures above come from synthetic tensors
-  shaped like H3, not from the model.
+  shaped like H3, not from the model. In a real ComfyUI run the node was also
+  **silently inert** until the router fix below (see Caveats).
 
 ```bash
 python tests/bench_attention.py --tokens 32768 --heads 56 --backend auto
@@ -232,8 +257,29 @@ tests/
 
 - The attention hook is **process-global**. Fine for a single-user sampling run;
   call `uninstall()` to put everything back.
+- **ComfyUI + MiniMax-H3 needs the by-value-import rebind.** comfy's own H3
+  port does `from comfy.ldm.modules.attention import optimized_attention` at
+  module load, so replacing the attribute on the defining module is not enough —
+  the model keeps calling the original forever and the node is silently inert
+  (measured: identical step time to baseline, zero Triton compiles).
+  `install()` now walks `sys.modules` and rebinds every comfy module that still
+  holds the original object; the wrapper also handles `skip_reshape=True`
+  4-D inputs, which H3 uses — and since comfy 0.38 those arrive wrapped in
+  single-owner `AttentionTensorContainer`s on every H3 call; the hook peeks
+  into them, defers to any registered `optimized_attention_override`, and
+  falls back to the original on any internal error so it can never take a run
+  down (first live run crashed exactly there before this guard existed).
+  Validated end-to-end against the real comfy tree
+  (`tests/_probe9_hook_rebind.py`): H3's own `optimized_attention` binding
+  routes to the VC kernel bit-identically, and short calls defer to the
+  original bit-identically. **Apply the node before the first sampling after a
+  restart**, and note that ComfyUI's torch.compile ("Comfy model compiler")
+  traces whatever function objects are installed at compile time — if the graph
+  was compiled before the node ran, it must be re-traced (restart) or the
+  compiler disabled (`--disable-comfy-compiler`) for the hook to be seen.
 - Only non-causal attention is accelerated. Calls with an `attn_mask`, or
   causal, or below `min_tokens`, or with head_dim ∉ {64, 128} go straight to the
-  original SDPA.
+  original SDPA. H3's per-call sequence can fall below `min_tokens` on short
+  segments — watch the stats, not the console banner.
 - H3's padding rows (tag −1) need a masked backend; this node does not
   accelerate masked attention yet. The diffusers port runs unmasked.

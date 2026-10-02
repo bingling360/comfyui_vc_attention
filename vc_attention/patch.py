@@ -40,6 +40,14 @@ __all__ = [
 
 _ORIGINALS: Dict[str, Callable] = {}
 
+# comfy >= 0.38 wraps q/k/v in single-owner containers before calling
+# optimized_attention (MiniMax-H3 does this on every call). Optional: the
+# package must keep importing (and falling back to plain tensors) without it.
+try:
+    from comfy.ldm.modules.attention import AttentionTensorContainer as _ATTN_CONTAINER
+except Exception:  # pragma: no cover
+    _ATTN_CONTAINER = None
+
 
 @dataclass
 class VCAttentionConfig:
@@ -284,17 +292,50 @@ def install(config: Optional[VCAttentionConfig] = None, model: Any = None) -> VC
 
             @functools.wraps(orig)
             def hooked(q, k, v, heads, *args, **kwargs):
-                b, n, _ = q.shape
-                d = q.shape[-1] // heads
-                q4 = q.view(b, n, heads, d).transpose(1, 2)
-                k4 = k.view(k.shape[0], k.shape[1], heads, d).transpose(1, 2)
-                v4 = v.view(v.shape[0], v.shape[1], heads, d).transpose(1, 2)
-                out = runtime.attention(q4, k4, v4)
-                if out is None:
+                try:
+                    t_opts = kwargs.get("transformer_options")
+                    if isinstance(t_opts, dict) and \
+                            t_opts.get("optimized_attention_override") is not None:
+                        # Another attention override is registered (attention-patch
+                        # custom nodes); it owns this call.
+                        return orig(q, k, v, heads, *args, **kwargs)
+
+                    if _ATTN_CONTAINER is not None and isinstance(q, _ATTN_CONTAINER):
+                        # comfy 0.38: MiniMax-H3 wraps every call's q/k/v in
+                        # single-owner containers. peek() reads without consuming,
+                        # so if we defer below, orig (which take()s them) still
+                        # works — and orig also accepts plain tensors directly.
+                        q, k, v = q.peek(), k.peek(), v.peek()
+
+                    if not (isinstance(q, torch.Tensor) and isinstance(k, torch.Tensor)
+                            and isinstance(v, torch.Tensor)):
+                        return orig(q, k, v, heads, *args, **kwargs)
+
+                    if q.dim() == 4:
+                        # skip_reshape=True callers (MiniMax-H3 among them) pass
+                        # (B, heads, S, D) already split.
+                        b, h_, s_, d_ = q.shape
+                        out = runtime.attention(q, k, v)
+                        if out is None:
+                            return orig(q, k, v, heads, *args, **kwargs)
+                        return out.transpose(1, 2).reshape(b, s_, h_ * d_)
+
+                    b, n, _ = q.shape
+                    d = q.shape[-1] // heads
+                    q4 = q.view(b, n, heads, d).transpose(1, 2)
+                    k4 = k.view(k.shape[0], k.shape[1], heads, d).transpose(1, 2)
+                    v4 = v.view(v.shape[0], v.shape[1], heads, d).transpose(1, 2)
+                    out = runtime.attention(q4, k4, v4)
+                    if out is None:
+                        return orig(q, k, v, heads, *args, **kwargs)
+                    return out.transpose(1, 2).reshape(b, n, heads * d)
+                except Exception:
+                    # The hook must never take sampling down with it. peek()
+                    # consumed nothing, so orig is always callable here.
                     return orig(q, k, v, heads, *args, **kwargs)
-                return out.transpose(1, 2).reshape(b, n, heads * d)
 
             comfy_attention.optimized_attention = hooked
+            _rebind_by_value_imports(orig, hooked)
     except Exception:
         pass
 
@@ -340,6 +381,26 @@ def _install_step_counter(model: Any, runtime: VCAttentionRuntime) -> None:
     denoiser.forward = wrapped
     denoiser._vc_step_wrapped = True         # type: ignore[attr-defined]
     _ORIGINALS.setdefault("denoiser", orig_forward)
+
+
+def _rebind_by_value_imports(orig: Callable, hooked: Callable) -> None:
+    """Rebind ``optimized_attention`` in modules that imported it by value.
+
+    ``from comfy.ldm.modules.attention import optimized_attention`` binds the
+    function object into the importer's namespace at import time, so replacing
+    the attribute on the defining module is not enough — comfy's own
+    MiniMax-H3 port (``comfy.ldm.minimax.model``) imports exactly that way and
+    would keep calling the original forever. Walk comfy's modules and swap any
+    namespace that still holds the original object.
+    """
+    import sys
+
+    for name, mod in list(sys.modules.items()):
+        if not name.startswith("comfy"):
+            continue
+        mdict = getattr(mod, "__dict__", None)
+        if mdict and mdict.get("optimized_attention", None) is orig:
+            mdict["optimized_attention"] = hooked
 
 
 def uninstall() -> None:
