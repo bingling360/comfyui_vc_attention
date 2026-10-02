@@ -1,0 +1,19 @@
+# VC-Attention for MiniMax-H3 -- ComfyUI custom node
+#
+# Nothing here is required for the node to load. Without the optional Triton
+# dependency the node installs cleanly but does not accelerate anything: the
+# router detects the missing fused kernel and leaves native SDPA in place, so
+# sampling never gets slower than baseline.
+
+# Already present in every ComfyUI install.
+torch>=2.4
+
+# Optional but effectively required for any speedup: the fused kernel is Triton.
+#
+#   Windows (ComfyUI portable / system python):
+#       <comfyui>\python_embeded\python.exe -m pip install triton-windows
+#   Linux:
+#       pip install triton
+#
+# Verify it loaded with:
+#       <comfyui>\python_embeded\python.exe -c "import triton; print(triton.__version__)"
