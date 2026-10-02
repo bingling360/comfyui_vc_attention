@@ -49,6 +49,40 @@ class DeviceProfile:
             f"expcast={self.recommended_expcast}"
         )
 
+    def expectation_note(self) -> str:
+        """One-line honest speed expectation for this architecture.
+
+        Measured on an RTX 4090 (2026-10, Triton 3.6-3.8, torch 2.10/cu130):
+        the kernel is correct there (25+ dB PSNR, real ComfyUI run) but is not
+        a speedup — say so up front instead of letting users benchmark it.
+        """
+        if self.sm == (8, 9):
+            return (
+                "Ada/RTX 40xx: correctness-only, NOT a speedup on this "
+                "architecture. Measured on an RTX 4090: kernel ~0.97x native "
+                "SDPA (no FP4 tensor cores, the fp8 PV path is blocked by a "
+                "Triton fp32->e4m3 conversion bug, softmax ALU unscaled). Use "
+                "here only to exercise or verify the algorithm."
+            )
+        if self.sm == (9, 0) or self.sm[0] == 10:
+            return (
+                "Hopper/Blackwell datacenter: the paper's 8-bit target "
+                "(kernel ~1.46-1.59x vs BF16 FlashAttention-4, end-to-end "
+                "1.13-1.19x on long sequences). The ExpCast branch is wired "
+                "but has not been exercised on these parts in this port."
+            )
+        if self.sm == (12, 0):
+            return (
+                "Blackwell workstation: the paper's NVFP4 target (kernel "
+                "2.3-3.6x, end-to-end 1.36-1.70x). NOTE: this port's kernel "
+                "currently implements the FP8 path only - the NVFP4 branch is "
+                "not written yet, so the node runs FP8 here today."
+            )
+        return (
+            "no low-bit tensor cores detected: the node will defer to native "
+            "SDPA (inactive)."
+        )
+
 
 def detect_profile(device: Optional[torch.device] = None) -> DeviceProfile:
     if device is None:

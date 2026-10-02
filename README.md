@@ -258,12 +258,31 @@ tests/
 
 ## Hardware notes
 
-- **RTX 5090 / RTX PRO 6000** (sm_120): NVFP4, V-Smooth only. ExpCast-FP8 does
-  not apply — NVFP4 codes have no affine map from a log-domain score, and at
-  4 bits softmax is not the longest pipeline stage.
-- **RTX 4090** (sm_89): no FP4 tensor cores. `auto` resolves to FP8.
-- **B200 / B300 / H200**: 8-bit + ExpCast-FP8. Blackwell datacenter dropped
-  INT4/INT8 MMA, so `int4` resolves to FP8 there.
+**RTX 40-series (Ada, sm_89): the node works but does not speed anything up.**
+This is measured, not guessed — on an RTX 4090 the fused kernel compiles,
+runs the full dense sequence inside real ComfyUI sampling, produces correct
+output (25+ dB PSNR at every sequence length), and still lands at **~0.97×
+native SDPA** at the kernel level (48.6 ms vs 47.2 ms at 16K tokens) and
+wall-clock parity in a real run. Three reasons, all hardware-bound: Ada has
+no FP4 tensor cores; the fp8 PV path is blocked by Triton's fp32→e4m3
+conversion bug (see above — still unfixed in Triton 3.8.0); and softmax ALU
+doesn't scale with the tensor cores. On 40-series, use this node only to
+exercise or verify the algorithm — for actual sampling speed on Ada, sparse
+attention (e.g. block-sparse schedulers) wins by skipping work rather than
+cheapening it. `auto` resolves to FP8 on Ada.
+
+- **H200 / B200 / B300** (sm_90 / 10.x): the paper's 8-bit target — kernel
+  1.46–1.59× vs BF16 FlashAttention-4, end-to-end 1.13–1.19× on long
+  sequences. ExpCast-FP8 applies; the branch is wired but has not been
+  exercised on these parts in this port.
+- **RTX 5090 / RTX PRO 6000** (sm_120): the paper's 4-bit target — kernel
+  2.3–3.6×, end-to-end 1.36–1.70× with NVFP4 (V-Smooth only; NVFP4 codes have
+  no affine map from a log-domain score, and at 4 bits softmax is not the
+  longest pipeline stage). NOTE: this port's kernel currently implements the
+  FP8 path only — the NVFP4 branch is not written yet, so today the node runs
+  FP8 there too.
+- **Blackwell datacenter dropped INT4/INT8 MMA**, so `int4` resolves to FP8
+  on 10.x; Ada and older keep INT8.
 
 ## Caveats
 

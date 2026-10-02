@@ -88,7 +88,11 @@ class VCAttentionMiniMaxH3:
     CATEGORY = CATEGORY
     DESCRIPTION = (
         "Nunchux VC-Attention adapted to MiniMax-H3: V-Smooth value grouping plus "
-        "low-bit QK/PV. Training-free; no checkpoint changes."
+        "low-bit QK/PV. Training-free; no checkpoint changes.\n\n"
+        "Speed expectations are architecture-bound: the paper's kernel gains "
+        "(1.46-3.6x attention) need Hopper/Blackwell. On RTX 40-series (Ada) this "
+        "node is correctness-only - measured ~parity with native SDPA on an RTX "
+        "4090 - so don't stack it expecting sampling speedups there."
     )
 
     def apply(
@@ -132,7 +136,8 @@ class VCAttentionMiniMaxH3:
             f"expcast={cfg.enable_expcast} block_rows={cfg.block_rows} "
             f"grouping on steps 0..{max(0, runtime.schedule.group_steps(total_steps) - 1)} "
             f"of {total_steps}\n"
-            f"[VC-Attention] {status}"
+            f"[VC-Attention] {status}\n"
+            f"[VC-Attention] {profile.expectation_note()}"
         )
         if "inactive" in status:
             print(
