@@ -141,11 +141,23 @@ Verified here on CPU (torch 2.14, `tests/`, 73 assertions):
   2. The mean-restoration term was missing the `v_scale` factor:
      `MU` stores *mean / v_scale* (as `prepare` documents), so the kernel must
      add `r * mu * vs`, not `r * mu`. The old term drowned the output (~−40 dB).
-  3. The PV `tl.dot` runs in **bf16**, not fp8: on sm_89 + Triton 3.6, an fp8
-     MMA whose A operand was computed in registers yields NaNs in every
+  3. The PV `tl.dot` runs in **bf16**, not fp8: on sm_89 + Triton, an fp8 MMA
+     whose A operand was computed in registers yields wrong values in every
      warp/stage configuration (the QK^T fp8 MMA with both operands from memory
      is fine, as is `torch._scaled_mm`). E4M3 → bf16 is exact, so the
      arithmetic is unchanged; the cost is half the PV MMA rate.
+
+     Root-caused with minimal repros (`tests/_probe14/15/16`): **Triton's
+     fp32→e4m3 `.to()` conversion itself produces wrong codes on sm_89** —
+     still broken in Triton 3.8.0. The MMA is innocent: computing the e4m3
+     codes with integer bit-math and `bitcast=True` gives a correct register-
+     fp8 dot, bit-matching the oracle encoder (25.66 dB). That workaround is
+     implemented and measured — and on the 4090 it is *slower* than the bf16
+     PV (54.6 vs 48.6 ms at 16K tokens: the ~10 extra int ALU ops per element
+     plus fp8 operand staging eat the 2× MMA gain), as is the one-FMA ExpCast
+     variant (49.9 ms, −0.55 dB). **bf16 PV stays the default on Ada**; the
+     fp8/bitcast path becomes interesting again on Hopper/Blackwell, where the
+     cvt path differs and fp8 rates double again.
 
   Verified results (identity permutation + real k-means permutation, trap armed
   to catch silent fallback to the reference path):
