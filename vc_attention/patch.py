@@ -314,8 +314,20 @@ def install(config: Optional[VCAttentionConfig] = None, model: Any = None) -> VC
                     t_opts = kwargs.get("transformer_options")
                     if isinstance(t_opts, dict) and \
                             t_opts.get("optimized_attention_override") is not None:
-                        # Another attention override is registered (attention-patch
-                        # custom nodes); it owns this call.
+                        # Another attention override owns this call. That is how
+                        # both the Comfy Kitchen backend node (ModelSampling* ->
+                        # set_model_optimized_attention) and Sol-Attn's generic
+                        # node register themselves, and Sol chains whatever was
+                        # already there as its fallback. VC-Attention sits
+                        # *outside* that chain, so it always loses -- say so,
+                        # because otherwise the node looks enabled and does
+                        # nothing. Measured: tests/_probe21_kitchen.py.
+                        _notify_once(
+                            "another attention backend is active "
+                            "(`optimized_attention_override`: Comfy Kitchen or "
+                            "Sol-Attn) -> VC-Attention is INACTIVE for those "
+                            "calls. Remove that node, or disable VC-Attention."
+                        )
                         return orig(q, k, v, heads, *args, **kwargs)
 
                     if _ATTN_CONTAINER is not None and isinstance(q, _ATTN_CONTAINER):
