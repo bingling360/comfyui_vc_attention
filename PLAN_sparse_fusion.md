@@ -232,6 +232,74 @@ tau 调度、参数接进节点、README 更新。
 
 ---
 
+## 10. 执行状态与重要修正（2026-10-04 02:00）
+
+### Phase 1 — 完成 ✅
+
+`_prepare_fast(sparse=True)` 产出 `k_mean` / `v_mean` / `thresh`。
+G1 通过（`_probe31`）：16K keep 0.324/0.178/0.118（probe22 独立算出 0.322/0.177/0.117），
+thresh 相对误差 ~6e-4。
+
+### Phase 2 — 机制就位，但有两处需要返工 ⚠️
+
+**已经对的**（`_probe33`）：用三种独立方式强制"全保留"（LOCAL=1e5 / SINK=1e5 /
+tau=-1000）都与 `SPARSE=False` **逐元素完全相同**（rel-err 0.000e+00）。
+→ 重构后的保留分支没问题，阈值与索引管线也没问题。
+
+**问题 1：近似路径写错了。** 读 Sol 的 `sol_kernel/fwd.py:150-200` 后确认：
+
+```python
+kc = ...            # 一组 block 的 K 均值
+vc = ...            # 一组 block 的 V 均值
+scores = tl.dot(q, kc.T) * scale_log2      # 代理分：对 block 均值做 matmul
+routed = (tl.sum(scores, 0)/q_len > threshold) | local | sink_kv
+approximate_scores = tl.where(approximate, scores, -inf)
+new_max = tl.maximum(row_max, tl.max(approximate_scores, 1))
+approximate_probability = exp2(approximate_scores - new_max)
+output += tl.dot(approximate_probability, vc)          # (BS, GROUP) @ (GROUP, BV)
+row_sum += tl.sum(approximate_probability * lengths, 1)
+```
+
+**两个我搞错的关键点**：
+1. 代理分是**对 block 均值 K 的一次 matmul**（一次算一整组 block），
+   不是每个 tile 单独算。
+2. 近似路径是 **(BLOCK_SIZE × GROUP_SIZE) @ (GROUP_SIZE × BV)** 的小 matmul ——
+   每个 block 只贡献**一列**（用块均值 V），不是 128 列。
+
+我用的是"每 tile 一个 outer product + 每列都记 proxy"，配合
+`m_new = max(m_i, proxy)`，导致被跳过块的权重比真实块高 10–100×。
+所以 tau=0 / 1.3 / 100 三个完全不比例的结果 PSNR 几乎一样（22.74/22.75/22.76）。
+
+**问题 2：路由开销 +27%。** 16K 下"全保留"要 41.16 ms，而 `SPARSE=False` 只要
+32.46 ms。每 tile 的 `q.to(fp32) * km[None,:]` 会materialize 一个 (64,128) fp32
+临时张量，寄存器压力大。应该改成用 **pooled query centroid** 算标量代理
+（一次 D 长度点积），而不是每行都算。
+
+### ⚠️ 对第 2.3 节投影的修正（重要）
+
+`_probe30` 测的是"**整个 tile 都跳过**"的上限。但 Sol-Attn 的真实算法
+**并不跳过整个 tile** —— 它对**所有** block 都做一次便宜的代理 QK（对块均值），
+只跳过 **PV**。所以：
+
+| | 我原来的投影 | 修正后 |
+|---|---|---|
+| 跳过内容 | QK + PV 全部 | 只跳 PV（QK 用便宜的代理版） |
+| 64K 投影 | ~105 ms | **待实测**，会明显高于 105 ms |
+
+16K 实测：32.46（无路由）→ 41.16（有路由，全保留）→ 28.98（有路由，keep 12%）。
+**净收益目前只有 3.5 ms（11%），远不及投影。** 要把路由开销压下去、
+把近似路径按 Sol 的结构重写，才谈得上收益。
+
+### 下一步（Phase 2 返工）
+
+1. 代理分改成 **pooled query centroid** 的标量点积（消除 27% 开销）
+2. 近似路径按 Sol 结构重写：块均值 V + 单列贡献，修正归一化
+3. 重跑 G2/G3/G4
+
+**SPARSE 默认 False，当前无回归（CPU 套件 73/73）。**
+
+---
+
 ## 9. 已确认的决定（2026-10-04）
 
 | 问题 | 决定 |
