@@ -396,3 +396,60 @@ row_sum += tl.sum(approximate_probability * lengths, 1)
 2. probe30 的 `TILE_SKIP` 已随稠密 kernel 恢复原签名（测量专用）。
 3. 若端到端质量可接受，可再考虑 tau 调度（Phase 4 的 `GroupSchedule` 复用）。
 
+---
+
+## 12. ⚠️ 决定性发现：ComfyUI 0.38 自带的块稀疏后端比本 port 快 3.7–5×（2026-10-04）
+
+用户问「Kitchen + ComfyUI 官方块稀疏 + Sol-Attn + VC 叠加能有多少加速」，
+查源码 + 实测后结论是：**不能叠加，而且本 port 在这个组合里贡献 0。**
+
+### 官方那两个节点是什么（`comfy_extras/nodes_sparse_attention.py`）
+
+- **`Model Attention Backend`**：选**稠密**后端（`pytorch attention` /
+  `comfy kitchen attention`）。源码原话：「When used with Block Sparse Attention,
+  this backend is used whenever sparse attention is inactive or unsupported.」
+- **`Model Sparse Attention`**（`BlockSparseAttention`，experimental）：块稀疏叠加层，
+  跑在 **`comfy_kitchen` 自己的稀疏内核**上（`ck.sol_attn` / `ck.sol_attn_chunked`），
+  三种模式：`sol-attn`（自适应 tau 阈值——**和本 port 同一个算法**）、`sla`（top-k）、
+  `vsa`（FastVideo 3D cube，需 FastH3 权重）。H3 走**直接 patch block** +
+  「分块 qkv producer」（4096 token 一片直接投进内核 int8 carrier，**Q/K/V 从不物化**）。
+
+**所以「Kitchen + 官方块稀疏」不是两样东西**——稀疏节点用的就是 Kitchen 的内核，
+两者是「稀疏 + 稠密回退」的分工。第三方 Sol-Attn 是同一个 tau 规则的第三种实现。
+
+### 实测（`tests/_probe37_official_sparse.py`，RTX 5090 / 56 heads / D=128）
+
+| 后端 | 16K | 64K | PSNR @16K/@64K |
+|---|---|---|---|
+| bf16 SDPA | 35.4 ms | 556 ms | 86.2 / 86.2 dB |
+| Kitchen 稠密 INT8 | 13.2 ms | 202 ms | 69.6 / 71.2 dB |
+| **官方 `ck.sol_attn` τ=1.3** | **3.02 ms** | **30.7 ms** | **36.0 / 38.5 dB** |
+| 官方 τ=1.3 + `extra_tokens=256`（节点默认） | 3.95 ms | 39.0 ms | 41.3 / 41.9 dB |
+| 官方 τ=2.0 | 1.96 ms | 12.5 ms | 35.0 / 36.1 dB |
+| **本 port 融合稀疏 τ=1.3** | 15.0 ms | 112 ms | 35.4 / 37.3 dB |
+
+**官方内核比本 port 快 3.7–5.0×，且 PSNR 略好。** 它还有结构性优势：不用付本 port 的
+主机侧 prepare（8.2/32.6 ms）、跨步复用 pooled kmean/vscale、是 C++/CUDA 不是 Triton。
+
+### 结论
+
+1. **叠加拿不到乘积**：全部抢同一个 `optimized_attention_override` 槽位，最多是
+   「单个最快后端」，实测两个注意力节点叠在一起 0.98–0.99×（probe27）。
+2. **本 port 被官方内核全面压制**（更快 + 略好），且在装有官方稀疏节点时会被
+   **静默顶掉**——官方节点在 `ON_PREPARE_STATE` 里每一步重装自己的 override
+   （源码注释：「so a node applied later cannot silently replace it」），
+   所以我们连抢槽位的机会都没有。
+3. **建议**：sm_120 + ComfyUI 0.38 直接用官方
+   `Model Attention Backend = comfy kitchen attention` +
+   `Model Sparse Attention = sol-attn, tau≈1.3`。**本节点不要放进这条链。**
+
+### 这对本 port 的意义（诚实评估）
+
+- 第 2.3 节的「~5.3× SDPA」投影本身是**对的**（实测 4.98×），Phase 2 返工也是成功的
+  （跳过真的省时间了，G2/G3 全过）。但它是在**没有把官方内核纳入比较**的前提下成立的。
+- 结论：本 port 的价值退回到「研究/正确性参考 + 一种独立实现」，**不再是 sm_120 上的
+  最优选择**。要不要继续投入（例如把 int8 + 64 块粒度做进内核去追 3.7× 的差距），
+  应由用户决定——那基本等于重写一个 comfy_kitchen。
+- README 顶部已加醒目章节说明；节点 DESCRIPTION 与 override 告警也已写明。
+- 未做：没有为了好看而隐瞒这个负结果。
+

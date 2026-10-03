@@ -73,6 +73,59 @@ read "Fused block sparsity" below before using it for real work, and set
 Watch the console on install — it prints the detected GPU, the resolved backend,
 the sparsity settings and whether the fused kernel is actually live.
 
+---
+
+## ComfyUI 0.38 already ships a faster sparse backend — read this first
+
+ComfyUI 0.38 has two native experimental attention nodes:
+
+- **Model Attention Backend** (`ModelAttentionBackend`) selects the *dense*
+  implementation: `pytorch attention` or `comfy kitchen attention` (INT8).
+- **Model Sparse Attention** (`BlockSparseAttention`) overlays block sparsity. It
+  runs on **comfy_kitchen's own sparse kernels** (`ck.sol_attn`,
+  `ck.sol_attn_chunked`) and offers `sol-attn` (Sol-Attn's adaptive τ threshold —
+  the same algorithm this repo implements), `sla` (SLA-style top-k) and `vsa`
+  (FastVideo's 3D video-cube VSA, needs FastH3 weights). On MiniMax-H3 it patches
+  the blocks directly and projects QKV in 4096-token chunks straight into the
+  kernel's int8 carriers, so full Q/K/V are never materialised.
+
+These two are **complementary by design, not stackable**: the sparse node handles
+the calls it can and falls back to whatever dense backend the other node
+selected. "Kitchen + official block-sparse" is therefore *one* sparse backend,
+not two — and the third-party Sol-Attn node is a third implementation of the
+same τ rule.
+
+Measured on the same harness as everything else here (RTX 5090, sm_120, 56
+heads, D=128, `h3_like`, `tests/_probe37_official_sparse.py`):
+
+| backend | 16384 tokens | 65536 tokens | PSNR @16K / @64K |
+|---|---|---|---|
+| bf16 FlashAttention | 35.4 ms (1.00×) | 556 ms (1.00×) | 86.2 / 86.2 dB |
+| Kitchen dense INT8 | 13.2 ms (2.68×) | 202 ms (2.76×) | 69.6 / 71.2 dB |
+| **official `ck.sol_attn` τ=1.3** | **3.02 ms (11.7×)** | **30.7 ms (18.2×)** | **36.0 / 38.5 dB** |
+| official τ=1.3, `extra_tokens=256` | 3.95 ms (8.9×) | 39.0 ms (14.3×) | 41.3 / 41.9 dB |
+| official τ=2.0 | 1.96 ms (18.0×) | 12.5 ms (44.5×) | 35.0 / 36.1 dB |
+| this repo, fused sparse τ=1.3 | 15.0 ms (2.4×) | 112 ms (5.0×) | 35.4 / 37.3 dB |
+
+So the official kernel is **3.7–5.0× faster than this port's fused sparse kernel
+at equal-or-better fidelity**. It also avoids this port's host-side prepare
+entirely (8.2 ms @16K / 32.6 ms @64K), reuses pooled K/V statistics across steps,
+and is a C++/CUDA kernel rather than Triton.
+
+**Conclusion for sm_120 + ComfyUI 0.38: use the native nodes.** Set
+`Model Attention Backend = comfy kitchen attention` and
+`Model Sparse Attention = sol-attn, tau≈1.3`. This port's fused sparsity is
+dominated. Worse, the native sparse node **re-installs its override on every
+prepare step** (so "a node applied later cannot silently replace it"), which
+means this node is silently shadowed whenever that node is present — it cannot
+win the slot even in principle. In that chain, leave this node out, or at least
+set `enable_sparsity=false` and `override_priority="defer"`.
+
+The numbers below are what this port achieves *on its own*; they remain valid
+only when the native sparse node is not in the graph.
+
+---
+
 ## Use from Python
 
 ```python

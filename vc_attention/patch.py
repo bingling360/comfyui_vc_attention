@@ -380,7 +380,11 @@ def install_attention_override(runtime: "VCAttentionRuntime", model: Any,
             "(`optimized_attention_override`) -> VC-Attention stays out. Set "
             "override_priority='front' to take priority instead; the fused "
             "sparse kernel beats Comfy Kitchen INT8 at H3's sequence length "
-            "(1.80x at 64K tokens) but is ~11% behind it at 16K."
+            "(1.80x at 64K tokens) but is ~11% behind it at 16K. NOTE: if the "
+            "other backend is ComfyUI's own Model Sparse Attention "
+            "(comfy_kitchen ck.sol_attn), leave it alone -- measured 3.7-5.0x "
+            "faster than this node's fused sparsity, and it re-installs its "
+            "override every step so this node cannot win the slot anyway."
         )
         return False
 
