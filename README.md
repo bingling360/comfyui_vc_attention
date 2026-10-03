@@ -226,11 +226,32 @@ Verified here on CPU (torch 2.14, `tests/`, 73 assertions):
   **This does not reach the paper's RTX 5090 claim (kernel 2.3–3.6×, end-to-end
   1.36–1.70×), and the reason is specific and measured.** Both of our matmuls
   run at fp8 = 2× the bf16 MMA rate; the paper's number requires the *4-bit*
-  path = 4×. On this stack the 4-bit path is unreachable: FP4 QK^T is a net
-  loss (host quantisation, above) and FP4 PV is impossible in principle (the
-  softmax probabilities are a register operand). With the matmuls capped at 2×
-  and roughly a third of kernel time being softmax/epilogue, ~1.4–1.5× kernel
-  is the ceiling here — consistent with what we measure.
+  path = 4×. That path is **marginal here, not impossible** — and the reason is
+  worth stating precisely, because it is not what it first looks like:
+
+  * **The hardware can do it.** sm_120 has a single-instruction converter,
+    `cvt.rn.satfinite.e2m1x2.f32`, and Triton can reach it through
+    `tl.inline_asm_elementwise`. Measured bit-exact against `quant.fp4_encode`
+    (`tests/_probe28_fp4cvt.py`). PyTorch does not expose it, which is why the
+    portable encoder needs 7 comparisons.
+  * **But it still does not pay.** With the PTX converter the whole NVFP4 pack
+    drops from 11.97 ms to 3.06 ms over a (16384×56, 128) tensor — a 3.9×
+    improvement (`tests/_probe29_fp4pack.py`) — yet that is still **8× the fp8
+    cast (0.37 ms)**. Q+K packing costs ~5.4 ms against the ~4.7 ms the fp4 QK
+    kernel saves, so it is a wash before accuracy is even considered.
+  * **PV is the structural one.** Its A operand is the softmax probability,
+    which the kernel already produces as E4M3 — so fp8 PV is *free* (2× the
+    bf16 rate for no extra work), while fp4 would need a genuine e2m1 encode of
+    every tile. `tl.dot_scaled` also needs packed operands, so the encode
+    cannot be skipped.
+  * **And the shape is wrong for it.** QK^T reduces over D=128; fp4 needs a long
+    GEMM to shine (3.82× at K=4096, but only 1.23× at K=128), and it costs ~10 dB
+    (QK rel-err 3.6% → 13.4%).
+
+  With the matmuls capped at 2× and roughly a third of kernel time being
+  softmax/epilogue, ~1.4–1.5× kernel is the ceiling here — consistent with what
+  we measure. Making 4-bit actually pay would mean moving the PTX converter
+  *inside* the kernel (for P), which is real research work, not a flag.
 
 - **Head-to-head against the alternatives already on this machine.** Same
   harness, same data (`tests/_probe23/26`), 56 heads, D=128, RTX 5090:
