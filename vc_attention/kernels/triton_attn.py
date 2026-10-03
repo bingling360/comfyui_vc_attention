@@ -192,6 +192,7 @@ if _HAS_TRITON:
         BETA: tl.constexpr,
         PV_FP8: tl.constexpr,
         QK_FP4: tl.constexpr,
+        TILE_SKIP: tl.constexpr = 1,
     ):
         start_m = tl.program_id(0)
         off_bh = tl.program_id(1)
@@ -223,7 +224,10 @@ if _HAS_TRITON:
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
         acc = tl.zeros([BLOCK_M, D], dtype=tl.float32)
 
-        for start_n in range(0, N_PAD, BLOCK_N):
+        # TILE_SKIP > 1 walks only every TILE_SKIP-th KV tile. It produces a
+        # WRONG result -- it exists to measure how kernel time scales with the
+        # number of tiles, i.e. the ceiling for Sol-Attn-style block sparsity.
+        for start_n in range(0, N_PAD, BLOCK_N * TILE_SKIP):
             offs_n = start_n + tl.arange(0, BLOCK_N)
             nmask = offs_n < N
 
