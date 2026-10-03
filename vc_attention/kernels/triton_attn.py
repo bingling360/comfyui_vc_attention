@@ -141,6 +141,15 @@ class Prepared(NamedTuple):
     q4_scale: Optional[torch.Tensor] = None  # (B, H, NP, D//16) uint8 e4m3
     k4: Optional[torch.Tensor] = None       # (B, H, D//2, NP) uint8
     k4_scale: Optional[torch.Tensor] = None  # (B, H, NP, D//16) uint8 e4m3
+    # Block-routing tensors, only populated when prepare(sparse=True).
+    # Sol-Attn's rule: proxy = <q, mean_k(block)> * scale, threshold =
+    # mean + tau*std over KV blocks; a block is kept if its proxy exceeds the
+    # threshold, or it is local / a sink. Skipped blocks are approximated from
+    # their proxy rather than dropped. See PLAN_sparse_fusion.md.
+    k_mean: Optional[torch.Tensor] = None    # (B, H, NB, D) fp32
+    v_mean: Optional[torch.Tensor] = None    # (B, H, NB, D) fp32
+    thresh: Optional[torch.Tensor] = None    # (B, H, NQB) fp32
+    n_qblk: int = 0                          # NQB = NP // q_block
 
 
 def nvfp4_pack(x: torch.Tensor, group: int = 16):
@@ -444,6 +453,10 @@ def _prepare_fast(
     hadamard: bool,
     smooth_k: bool,
     qk_fp4: bool = False,
+    sparse: bool = False,
+    tau: float = 1.3,
+    q_block: int = 64,
+    scale: Optional[float] = None,
 ) -> Prepared:
     b, h, n, d = q.shape
     G = b * h
@@ -505,6 +518,29 @@ def _prepare_fast(
     v_codes = (resid / v_scale.to(vb.dtype).unsqueeze(2)).to(torch.float8_e4m3fn)
     mu_over_scale = mu / v_scale
 
+    k_mean = v_mean = thresh = None
+    n_qblk = 0
+    if sparse:
+        # Sol-Attn's routing statistics, computed on exactly the tensors the
+        # kernel sees: q_t (hadamard'd, padded) and k_t (hadamard'd, smoothed,
+        # permuted, padded). Hadamard is orthonormal so <Hq, Hk> = <q, k>, and
+        # the K smoothing shifts every score of a query by the same constant,
+        # which softmax ignores -- so the proxy is consistent with the scores.
+        sc = scale if scale is not None else d ** -0.5
+        k_mean = k_t.reshape(G, nb, block_rows, d).float().mean(dim=2)     # (G, NB, D)
+        v_mean = mu                                                        # (G, NB, D)
+        n_qblk = n_pad // q_block
+        q_cent = q_t.reshape(G, n_qblk, q_block, d).float().mean(dim=2)    # (G, NQB, D)
+        proxy = torch.matmul(q_cent, k_mean.transpose(-1, -2)) * sc        # (G, NQB, NB)
+        # Population std, matching Sol-Attn's E[x^2] - E[x]^2 form.
+        thr = proxy.mean(dim=-1, keepdim=True) \
+            + tau * proxy.std(dim=-1, keepdim=True, unbiased=False)
+        thresh = thr.reshape(G, n_qblk).contiguous()
+        del proxy, q_cent
+        k_mean = k_mean.reshape(b, h, nb, d).contiguous()
+        v_mean = v_mean.reshape(b, h, nb, d).contiguous()
+        thresh = thresh.reshape(b, h, n_qblk).contiguous()
+
     return Prepared(
         q=q_codes.reshape(b, h, n_pad, d).contiguous(),
         q_scale=q_scale.reshape(b, h, n_pad).contiguous().float(),
@@ -518,6 +554,10 @@ def _prepare_fast(
         q4_scale=q4_scale,
         k4=k4,
         k4_scale=k4_scale,
+        k_mean=k_mean,
+        v_mean=v_mean,
+        thresh=thresh,
+        n_qblk=n_qblk,
     )
 
 
