@@ -29,12 +29,38 @@ def nvfp4_quant(x):
     R, K = x.shape
     xb = x.float().reshape(R, K // 16, 16)
     amax = xb.abs().amax(-1, keepdim=True).clamp(min=1e-30)
-    micro_code = Q.e4m3_encode(amax / 6.0)            # uint8 (R, K//16)
+    micro_code = Q.e4m3_encode((amax / 6.0).reshape(R, K // 16))
     micro_val = Q.e4m3_decode(micro_code).clamp(min=1e-30)
     q = (xb / micro_val.unsqueeze(-1)).clamp(-6, 6)
     codes = Q.fp4_encode(q).to(torch.uint8)           # (R, K) nibbles
     packed = (codes[:, 0::2] & 0xF) | ((codes[:, 1::2] & 0xF) << 4)
     return packed, micro_code
+
+
+
+
+def nvfp4_quant_kfirst(w):
+    """(K, N) -> packed (K//2, N) uint8 + micro (K//16, N) uint8, groups along K."""
+    K, N = w.shape
+    xb = w.float().reshape(K // 16, 16, N)
+    amax = xb.abs().amax(dim=1, keepdim=True).clamp(min=1e-30)
+    micro_code = Q.e4m3_encode((amax / 6.0).reshape(K // 16, N))
+    micro_val = Q.e4m3_decode(micro_code).reshape(K // 16, 1, N).clamp(min=1e-30)
+    q = (xb / micro_val).clamp(-6, 6)
+    codes = Q.fp4_encode(q).to(torch.uint8).reshape(K // 16, 16, N)
+    lo = codes[:, 0::2, :]
+    hi = (codes[:, 1::2, :] & 0xF) << 4
+    packed = (lo | hi).reshape(K // 2, N)
+    return packed, micro_code
+
+
+def nvfp4_dequant_kfirst(packed, micro_code):
+    K, N = packed.shape
+    lo = (packed & 0xF).long()
+    hi = ((packed >> 4) & 0xF).long()
+    v = torch.stack([GRID[lo], GRID[hi]], dim=-1).reshape(K // 2, 2, N).reshape(K, N)
+    micro = Q.e4m3_decode(micro_code).repeat_interleave(16, dim=0)
+    return v * micro
 
 
 def nvfp4_dequant(packed, micro_code):
@@ -111,9 +137,9 @@ M0, N0, K0 = 256, 256, 128
 x = torch.randn(M0, K0, device="cuda") * 0.5
 w = torch.randn(N0, K0, device="cuda") * 0.5          # (N, K) row-major tokens
 ac, asc = nvfp4_quant(x)
-bc, bsc = nvfp4_quant(w.t().contiguous())              # (K, N) -> K-first packing
+bc, bsc = nvfp4_quant_kfirst(w)              # (K, N) -> K-first packing
 out = run_nvfp4(ac, asc, bc, bsc, M0, N0, K0)
-ref = nvfp4_dequant(ac, asc) @ nvfp4_dequant(bc, bsc).T
+ref = nvfp4_dequant(ac, asc) @ nvfp4_dequant_kfirst(bc, bsc)
 rel = float((out - ref).abs().max() / ref.abs().mean().clamp(min=1e-9))
 print(f"A NVFP4 correctness: max|diff|={float((out-ref).abs().max()):.4f} rel={rel:.4f} "
       f"finite={bool(torch.isfinite(out).all())}")
@@ -123,9 +149,9 @@ M, N, K = 8192, 8192, 128
 x = torch.randn(M, K, device="cuda") * 0.5
 w = torch.randn(N, K, device="cuda") * 0.5
 ac, asc = nvfp4_quant(x)
-bc, bsc = nvfp4_quant(w.t().contiguous())
+bc, bsc = nvfp4_quant_kfirst(w)
 xd = nvfp4_dequant(ac, asc).to(torch.bfloat16)
-wd = nvfp4_dequant(bc, bsc).to(torch.bfloat16).T.contiguous()
+wd = nvfp4_dequant_kfirst(bc, bsc).to(torch.bfloat16).T.contiguous()
 
 t4 = bench(lambda: run_nvfp4(ac, asc, bc, bsc, M, N, K))
 outb = torch.empty(M, N, device="cuda", dtype=torch.float32)
