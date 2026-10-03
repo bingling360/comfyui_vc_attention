@@ -114,6 +114,13 @@ class TritonConfig:
     # QK^T rel-err 0.134 vs 0.036 for fp8, and attention PSNR 44.9 dB vs 56.8
     # (probe20). Hence opt-in, not default.
     qk_fp4: bool = False
+    # Sol-Attn-style block sparsity fused into the kernel. See
+    # PLAN_sparse_fusion.md. `tau` is the routing threshold in std-devs above
+    # the mean block proxy; larger = fewer blocks kept = faster, lower quality.
+    sparse: bool = False
+    tau: float = 1.3
+    local_blocks: int = 1     # |q_block - kv_block| <= this stays exact
+    sink_blocks: int = 0      # first N KV blocks stay exact (H3 conditioning)
 
 
 def _default_pv_fp8() -> bool:
@@ -191,6 +198,7 @@ if _HAS_TRITON:
     def _vc_attn_fwd(
         Q, QS, K, KS, V, VS, MU, Out,
         Q4, Q4S, K4, K4S,           # NVFP4 Q/K (only read when QK_FP4)
+        KMEAN, VMEAN, THRESH,       # block routing (only read when SPARSE)
         sm_scale,
         N,                          # true token count (masks)
         N_PAD,                      # padded token count (loop bound, strides)
@@ -201,6 +209,9 @@ if _HAS_TRITON:
         BETA: tl.constexpr,
         PV_FP8: tl.constexpr,
         QK_FP4: tl.constexpr,
+        SPARSE: tl.constexpr = False,
+        LOCAL: tl.constexpr = 1,
+        SINK: tl.constexpr = 0,
         TILE_SKIP: tl.constexpr = 1,
     ):
         start_m = tl.program_id(0)
@@ -239,69 +250,101 @@ if _HAS_TRITON:
         for start_n in range(0, N_PAD, BLOCK_N * TILE_SKIP):
             offs_n = start_n + tl.arange(0, BLOCK_N)
             nmask = offs_n < N
-
-            v = tl.load(V + base + offs_n[:, None] * D + offs_d[None, :],
-                        mask=nmask[:, None], other=0.0)
-
-            # ---- scores -----------------------------------------------------
-            if QK_FP4:
-                kpk = tl.load(K4 + off_bh.to(tl.int64) * (D // 2) * N_PAD
-                              + offs_dp[:, None] * N_PAD + offs_n[None, :],
-                              mask=nmask[None, :], other=0)
-                ksc = tl.load(K4S + off_bh.to(tl.int64) * N_PAD * (D // 16)
-                              + offs_n[:, None] * (D // 16) + offs_dg[None, :],
-                              mask=nmask[:, None], other=0).to(tl.float8e4nv, bitcast=True)
-                s = tl.dot_scaled(qpk, qsc, "e2m1", kpk, ksc, "e2m1", out_dtype=tl.float32)
-                s = s * sm_scale
-            else:
-                # fp8 x fp8 -> fp32, then the per-token scales
-                k = tl.load(K + base + offs_n[:, None] * D + offs_d[None, :],
-                            mask=nmask[:, None], other=0.0)
-                ks = tl.load(KS + off_bh * N_PAD + offs_n, mask=nmask, other=0.0)
-                s = tl.dot(q, tl.trans(k))
-                s = s * (qs[:, None] * ks[None, :]) * sm_scale
-            s = tl.where(nmask[None, :], s, -1.0e30)
-
-            m_new = tl.maximum(m_i, tl.max(s, 1))
-            m_new = tl.where(m_new == float("-inf"), 0.0, m_new)
-            alpha = tl.math.exp2((m_i - m_new) * LOG2E)
-            alpha = tl.where(m_i == float("-inf"), 0.0, alpha)
-
-            if EXPCAST:
-                # Write the E4M3 byte directly: one FMA, one round, one clip.
-                u = (s - m_new[:, None]) * LOG2E + 8.0
-                code = u * 8.0 + (56.0 + BETA)
-                code = tl.maximum(tl.minimum(code, 120.0), 0.0)
-                code_i = code.to(tl.int32).to(tl.uint8)
-                p8 = code_i.to(tl.float8e4nv, bitcast=True)
-            else:
-                p8 = (tl.math.exp2((s - m_new[:, None]) * LOG2E) * P_SCALE).to(tl.float8e4nv)
-
-            r = tl.sum(p8.to(tl.float32), 1) / P_SCALE
-
-            # ---- PV with the per-block scale, then restore the block mean ---
-            # fp8 PV (E4M3 x E4M3 -> fp32) on parts where the register-operand
-            # fp8 dot is correct: that doubles the MMA rate vs bf16 at identical
-            # precision, since both operands are already E4M3. On sm_89 the
-            # register fp32->e4m3 conversion is broken (probe14/15/16), so the
-            # A operand computed in registers yields wrong values; there the
-            # bf16 dot is used (E4M3 -> bf16 is exact, so the arithmetic is
-            # unchanged, at half the MMA rate).
-            if PV_FP8:
-                tile = tl.dot(p8, v)
-            else:
-                tile = tl.dot(p8.to(tl.bfloat16), v.to(tl.bfloat16))
             blk = start_n // BLOCK_N
-            vs = tl.load(VS + off_bh * nb * D + blk * D + offs_d)
-            mu = tl.load(MU + off_bh * nb * D + blk * D + offs_d)
 
-            acc = acc * alpha[:, None]
-            acc += tile * (vs[None, :] / P_SCALE)
-            # MU stores mean/v_scale (test_prepare asserts mu * v_scale == mean),
-            # so the restoration needs both factors.
-            acc += r[:, None] * (mu[None, :] * vs[None, :])
-            l_i = l_i * alpha + r
-            m_i = m_new
+            # ---- Sol-Attn block routing -------------------------------------
+            # proxy = <q, mean_k(block)> * scale, compared against a per
+            # (query-block, head) threshold precomputed host-side. `keep` must be
+            # a program-level scalar so the whole tile can be skipped -- that is
+            # where the time saving comes from. Local neighbours and sink blocks
+            # stay exact.
+            proxy = tl.zeros([BLOCK_M], dtype=tl.float32)
+            if SPARSE:
+                km = tl.load(KMEAN + off_bh.to(tl.int64) * nb * D + blk * D + offs_d)
+                proxy = tl.sum(q.to(tl.float32) * km[None, :], axis=1) * sm_scale
+                thr = tl.load(THRESH + off_bh * (N_PAD // BLOCK_M) + start_m)
+                keep = (tl.sum(proxy, axis=0) / BLOCK_M > thr) \
+                    | (tl.abs(start_m - blk) <= LOCAL) | (blk < SINK)
+            else:
+                keep = True
+
+            if keep:
+                v = tl.load(V + base + offs_n[:, None] * D + offs_d[None, :],
+                            mask=nmask[:, None], other=0.0)
+
+                # ---- scores -------------------------------------------------
+                if QK_FP4:
+                    kpk = tl.load(K4 + off_bh.to(tl.int64) * (D // 2) * N_PAD
+                                  + offs_dp[:, None] * N_PAD + offs_n[None, :],
+                                  mask=nmask[None, :], other=0)
+                    ksc = tl.load(K4S + off_bh.to(tl.int64) * N_PAD * (D // 16)
+                                  + offs_n[:, None] * (D // 16) + offs_dg[None, :],
+                                  mask=nmask[:, None], other=0).to(tl.float8e4nv, bitcast=True)
+                    s = tl.dot_scaled(qpk, qsc, "e2m1", kpk, ksc, "e2m1", out_dtype=tl.float32)
+                    s = s * sm_scale
+                else:
+                    # fp8 x fp8 -> fp32, then the per-token scales
+                    k = tl.load(K + base + offs_n[:, None] * D + offs_d[None, :],
+                                mask=nmask[:, None], other=0.0)
+                    ks = tl.load(KS + off_bh * N_PAD + offs_n, mask=nmask, other=0.0)
+                    s = tl.dot(q, tl.trans(k))
+                    s = s * (qs[:, None] * ks[None, :]) * sm_scale
+                s = tl.where(nmask[None, :], s, -1.0e30)
+
+                m_new = tl.maximum(m_i, tl.max(s, 1))
+                m_new = tl.where(m_new == float("-inf"), 0.0, m_new)
+                alpha = tl.math.exp2((m_i - m_new) * LOG2E)
+                alpha = tl.where(m_i == float("-inf"), 0.0, alpha)
+
+                if EXPCAST:
+                    # Write the E4M3 byte directly: one FMA, one round, one clip.
+                    u = (s - m_new[:, None]) * LOG2E + 8.0
+                    code = u * 8.0 + (56.0 + BETA)
+                    code = tl.maximum(tl.minimum(code, 120.0), 0.0)
+                    code_i = code.to(tl.int32).to(tl.uint8)
+                    p8 = code_i.to(tl.float8e4nv, bitcast=True)
+                else:
+                    p8 = (tl.math.exp2((s - m_new[:, None]) * LOG2E) * P_SCALE).to(tl.float8e4nv)
+
+                r = tl.sum(p8.to(tl.float32), 1) / P_SCALE
+
+                # ---- PV with the per-block scale, then restore the block mean
+                # fp8 PV (E4M3 x E4M3 -> fp32) on parts where the register-
+                # operand fp8 dot is correct: that doubles the MMA rate vs bf16
+                # at identical precision, since both operands are already E4M3.
+                # On sm_89 the register fp32->e4m3 conversion is broken
+                # (probe14/15/16), so there the bf16 dot is used (E4M3 -> bf16
+                # is exact, so the arithmetic is unchanged, at half the rate).
+                if PV_FP8:
+                    tile = tl.dot(p8, v)
+                else:
+                    tile = tl.dot(p8.to(tl.bfloat16), v.to(tl.bfloat16))
+                vs = tl.load(VS + off_bh * nb * D + blk * D + offs_d)
+                mu = tl.load(MU + off_bh * nb * D + blk * D + offs_d)
+
+                acc = acc * alpha[:, None]
+                acc += tile * (vs[None, :] / P_SCALE)
+                # MU stores mean/v_scale (test_prepare asserts mu * v_scale ==
+                # mean), so the restoration needs both factors.
+                acc += r[:, None] * (mu[None, :] * vs[None, :])
+                l_i = l_i * alpha + r
+                m_i = m_new
+            else:
+                # Skipped block: approximate it from its proxy rather than
+                # dropping it (Sol-Attn's "reuse below-threshold score
+                # columns"). Every column is treated as scoring `proxy`, so the
+                # tile adds BLOCK_N * v_mean to the numerator and BLOCK_N * p to
+                # the denominator. K and V are never loaded.
+                vm = tl.load(VMEAN + off_bh.to(tl.int64) * nb * D + blk * D + offs_d)
+                m_new = tl.maximum(m_i, proxy)
+                m_new = tl.where(m_new == float("-inf"), 0.0, m_new)
+                alpha = tl.math.exp2((m_i - m_new) * LOG2E)
+                alpha = tl.where(m_i == float("-inf"), 0.0, alpha)
+                p_row = tl.math.exp2((proxy - m_new) * LOG2E)
+                acc = acc * alpha[:, None]
+                acc += p_row[:, None] * (BLOCK_N * vm)[None, :]
+                l_i = l_i * alpha + BLOCK_N * p_row
+                m_i = m_new
 
         acc = acc / l_i[:, None]
         tl.store(Out + base + offs_m[:, None] * D + offs_d[None, :],
@@ -587,11 +630,16 @@ def vc_attention_triton(
 
     try:
         qk_fp4 = bool(cfg.qk_fp4) and q.is_cuda
+        sparse = bool(cfg.sparse) and q.is_cuda
         if q.is_cuda:
             p = _prepare_fast(q, k, v, perm, block_rows=cfg.block_n,
-                              hadamard=True, smooth_k=True, qk_fp4=qk_fp4)
+                              hadamard=True, smooth_k=True, qk_fp4=qk_fp4,
+                              sparse=sparse, tau=cfg.tau,
+                              q_block=cfg.block_m, scale=scale)
         else:
             p = prepare(q, k, v, perm, block_rows=cfg.block_n, hadamard=True)
+        if sparse and p.thresh is None:
+            sparse = False      # CPU/reference prepare has no routing stats
         # The kernel indexes Out with the padded pitch (base = bh * N_PAD * D),
         # so the buffer must be N_PAD long, not n — a plain empty_like(q)
         # mis-addresses every head after the first whenever n % block_rows != 0.
@@ -604,9 +652,13 @@ def vc_attention_triton(
         q4s = p.q4_scale if qk_fp4 else p.q_scale
         k4 = p.k4 if qk_fp4 else p.k
         k4s = p.k4_scale if qk_fp4 else p.k_scale
+        kmean = p.k_mean if sparse else p.k
+        vmean = p.v_mean if sparse else p.v
+        thresh = p.thresh if sparse else p.q_scale
         _vc_attn_fwd[grid](
             p.q, p.q_scale, p.k, p.k_scale, p.v, p.v_scale, p.mu, out,
             q4, q4s, k4, k4s,
+            kmean, vmean, thresh,
             scale, n, p.n_pad, d,
             BLOCK_M=cfg.block_m,
             BLOCK_N=cfg.block_n,
@@ -614,6 +666,9 @@ def vc_attention_triton(
             BETA=cfg.expcast_beta,
             PV_FP8=pv_fp8,
             QK_FP4=qk_fp4,
+            SPARSE=sparse,
+            LOCAL=cfg.local_blocks,
+            SINK=cfg.sink_blocks,
             num_warps=cfg.num_warps,
             num_stages=cfg.num_stages,
         )
