@@ -29,17 +29,22 @@ restoration matches the product that was actually taken.
 
 Status
 ------
-Verified on an RTX 4090 (Triton 3.6, torch 2.10/cu130): compiles and matches
-the oracle at 25.7 dB PSNR on H3-shaped random tensors. Two deviations from
-the paper's kernel were needed there:
+Verified on an RTX 4090 (Triton 3.6) and an RTX 5090 (sm_120, Triton 3.8):
+compiles and matches the oracle at 25.7 dB PSNR on H3-shaped random tensors.
+Deviations from the paper's kernel:
 
 1. ``LOG2E`` / ``P_SCALE`` must be ``tl.constexpr`` instances — plain module
    globals are rejected at compile time (Triton >= 3.2).
-2. The PV ``tl.dot`` runs in bf16. An fp8 MMA whose A operand was computed in
-   registers (as opposed to loaded from memory) produces NaNs on sm_89 across
-   every warp/stage configuration; E4M3 -> bf16 is exact so the arithmetic is
-   unchanged. ``EXPCAST`` shares this call site but has not been exercised on
-   datacenter hardware.
+2. On **sm_89** the PV ``tl.dot`` runs in bf16: an fp8 MMA whose A operand was
+   computed in registers produces wrong values on sm_89 across every
+   warp/stage configuration (Triton's fp32->e4m3 register conversion is
+   broken). E4M3 -> bf16 is exact so the arithmetic is unchanged.
+   On **sm_120** that bug is absent (probe19), so ``PV_FP8`` defaults on there
+   and the PV MMA runs at 2x the bf16 rate at identical precision.
+3. ``QK_FP4`` (NVFP4 Q/K via ``tl.dot_scaled``) is implemented and correct, but
+   opt-in: on sm_120 it is a net loss for attention (the QK reduction is only
+   D=128, while host-side NVFP4 quantization costs ~23 ms/layer and QK error
+   rises 3.6% -> 13.4%). See ``tests/bench_pv.py``.
 
 :func:`vc_attention_triton` is
 guarded so any compile or launch failure falls back to the reference path.
@@ -87,12 +92,36 @@ def has_triton() -> bool:
 
 @dataclass
 class TritonConfig:
-    block_m: int = 128
+    # Tuned on an RTX 5090 (sm_120) at 16384 tokens / 56 heads / D=128 with the
+    # fp8 PV path: BM=64, 4 warps, 2 stages -> 24.4 ms vs 31.0 ms for the old
+    # 128/8/3 default (bf16 SDPA: 35.3 ms). BLOCK_M=256 spills catastrophically.
+    block_m: int = 64
     block_n: int = 128      # must equal block_rows: one value block per KV tile
-    num_warps: int = 8
-    num_stages: int = 3
+    num_warps: int = 4
+    num_stages: int = 2
     enable_expcast: bool = False
     expcast_beta: float = -0.35
+    # PV in fp8 (E4M3 x E4M3 -> fp32) instead of bf16. Doubles the PV MMA rate,
+    # but only where the register-operand fp8 dot is correct: sm_120 (verified
+    # here, max|diff|=0) and Hopper/datacenter Blackwell. On sm_89 Triton's
+    # fp32->e4m3 register conversion is broken (see _probe14/15/16), so this
+    # stays off there. ``None`` -> decide from the device capability.
+    pv_fp8: Optional[bool] = None
+    # QK^T in NVFP4 (e2m1 + per-16 e4m3 microscale) via tl.dot_scaled instead of
+    # per-token E4M3. Both operands come from memory, so this is the one place
+    # the FP4 tensor cores are reachable in attention. Measured on sm_120:
+    # 530 TFLOP/s fp4 vs 277 fp8 vs 139 bf16. But NVFP4 has a 2-bit mantissa:
+    # QK^T rel-err 0.134 vs 0.036 for fp8, and attention PSNR 44.9 dB vs 56.8
+    # (probe20). Hence opt-in, not default.
+    qk_fp4: bool = False
+
+
+def _default_pv_fp8() -> bool:
+    """Register-fp8 PV is safe on sm_90 and sm_10x/sm_120, not on sm_89."""
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability(0)
+    return (major, minor) >= (9, 0) and (major, minor) != (8, 9)
 
 
 class Prepared(NamedTuple):
@@ -106,6 +135,45 @@ class Prepared(NamedTuple):
     v_scale: torch.Tensor   # (B, H, NB, D)
     mu: torch.Tensor        # (B, H, NB, D) block mean / v_scale
     n_pad: int
+    # NVFP4 Q/K, only populated when prepare(qk_fp4=True). Q packs along D as
+    # (B,H,NP,D//2); K must be K-first for dot_scaled, i.e. (B,H,D//2,NP).
+    q4: Optional[torch.Tensor] = None       # (B, H, NP, D//2) uint8
+    q4_scale: Optional[torch.Tensor] = None  # (B, H, NP, D//16) uint8 e4m3
+    k4: Optional[torch.Tensor] = None       # (B, H, D//2, NP) uint8
+    k4_scale: Optional[torch.Tensor] = None  # (B, H, NP, D//16) uint8 e4m3
+
+
+def nvfp4_pack(x: torch.Tensor, group: int = 16):
+    """(..., D) float -> (packed (..., D//2) uint8, e4m3 micro codes (..., D//16)).
+
+    Mirrors what ``tl.dot_scaled`` expects: low nibble = even element, e4m3
+    microscale per ``group`` elements along the last dim. Verified on sm_120
+    against the exact dequant (probe19, rel err 0.0).
+
+    Speed note: PyTorch 2.10 has no float->float4_e2m1fn_x2 cast, so the e2m1
+    codes are built from 7 comparisons (RNE ties handled explicitly to match
+    quant.fp4_encode). The e4m3 microscale uses the *native* cast, which is
+    ~30x faster than the portable integer encoder. Even so this costs ~6 ms per
+    (16K x 128) tensor -- against ~0.03 ms for the fp8 path's single fused cast,
+    which is why NVFP4 Q/K is opt-in (see TritonConfig.qk_fp4).
+    """
+    d = x.shape[-1]
+    xb = x.reshape(*x.shape[:-1], d // group, group)
+    amax = xb.detach().abs().amax(-1, keepdim=True).clamp(min=1e-30)
+    micro_fp8 = (amax / 6.0).clamp(max=448.0).to(torch.float8_e4m3fn)
+    micro = micro_fp8.view(torch.uint8).squeeze(-1)          # e4m3 codes
+    mv = micro_fp8.float().clamp(min=1e-30)
+    a = (xb / mv).abs().clamp(max=6.0)
+    code = (a > 0.25).to(torch.uint8)
+    for b in (0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
+        code = code + (a > b).to(torch.uint8)
+    # RNE: midpoints between code j and j+1 round to the even code, i.e. the odd
+    # breakpoints (0.75, 1.75, 3.5) round *up* on an exact tie.
+    code = code + ((a == 0.75) | (a == 1.75) | (a == 3.5)).to(torch.uint8)
+    sign = (xb < 0).to(torch.uint8) << 3
+    codes = (code | sign).reshape(*x.shape[:-1], d)
+    packed = (codes[..., 0::2] & 0xF) | ((codes[..., 1::2] & 0xF) << 4)
+    return packed.contiguous(), micro.contiguous()
 
 
 if _HAS_TRITON:
@@ -113,6 +181,7 @@ if _HAS_TRITON:
     @triton.jit
     def _vc_attn_fwd(
         Q, QS, K, KS, V, VS, MU, Out,
+        Q4, Q4S, K4, K4S,           # NVFP4 Q/K (only read when QK_FP4)
         sm_scale,
         N,                          # true token count (masks)
         N_PAD,                      # padded token count (loop bound, strides)
@@ -121,6 +190,8 @@ if _HAS_TRITON:
         BLOCK_N: tl.constexpr,
         EXPCAST: tl.constexpr,
         BETA: tl.constexpr,
+        PV_FP8: tl.constexpr,
+        QK_FP4: tl.constexpr,
     ):
         start_m = tl.program_id(0)
         off_bh = tl.program_id(1)
@@ -130,9 +201,23 @@ if _HAS_TRITON:
         nb = N_PAD // BLOCK_N
 
         base = off_bh.to(tl.int64) * N_PAD * D
-        q = tl.load(Q + base + offs_m[:, None] * D + offs_d[None, :],
-                    mask=offs_m[:, None] < N, other=0.0)
-        qs = tl.load(QS + off_bh * N_PAD + offs_m, mask=offs_m < N, other=0.0)
+        if QK_FP4:
+            # NVFP4 Q/K: packed along D. Q is (NP, D//2) token-major; K is stored
+            # K-first as (D//2, NP) because dot_scaled wants the reduction dim on
+            # axis 0 of the rhs. The microscales carry the per-16-group scale, so
+            # no per-token scale multiply is needed afterwards.
+            offs_dp = tl.arange(0, D // 2)
+            offs_dg = tl.arange(0, D // 16)
+            qpk = tl.load(Q4 + off_bh.to(tl.int64) * N_PAD * (D // 2)
+                          + offs_m[:, None] * (D // 2) + offs_dp[None, :],
+                          mask=offs_m[:, None] < N, other=0)
+            qsc = tl.load(Q4S + off_bh.to(tl.int64) * N_PAD * (D // 16)
+                          + offs_m[:, None] * (D // 16) + offs_dg[None, :],
+                          mask=offs_m[:, None] < N, other=0).to(tl.float8e4nv, bitcast=True)
+        else:
+            q = tl.load(Q + base + offs_m[:, None] * D + offs_d[None, :],
+                        mask=offs_m[:, None] < N, other=0.0)
+            qs = tl.load(QS + off_bh * N_PAD + offs_m, mask=offs_m < N, other=0.0)
 
         m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -142,15 +227,26 @@ if _HAS_TRITON:
             offs_n = start_n + tl.arange(0, BLOCK_N)
             nmask = offs_n < N
 
-            k = tl.load(K + base + offs_n[:, None] * D + offs_d[None, :],
-                        mask=nmask[:, None], other=0.0)
-            ks = tl.load(KS + off_bh * N_PAD + offs_n, mask=nmask, other=0.0)
             v = tl.load(V + base + offs_n[:, None] * D + offs_d[None, :],
                         mask=nmask[:, None], other=0.0)
 
-            # ---- scores: fp8 x fp8 -> fp32, then the per-token scales -------
-            s = tl.dot(q, tl.trans(k))
-            s = s * (qs[:, None] * ks[None, :]) * sm_scale
+            # ---- scores -----------------------------------------------------
+            if QK_FP4:
+                kpk = tl.load(K4 + off_bh.to(tl.int64) * (D // 2) * N_PAD
+                              + offs_dp[:, None] * N_PAD + offs_n[None, :],
+                              mask=nmask[None, :], other=0)
+                ksc = tl.load(K4S + off_bh.to(tl.int64) * N_PAD * (D // 16)
+                              + offs_n[:, None] * (D // 16) + offs_dg[None, :],
+                              mask=nmask[:, None], other=0).to(tl.float8e4nv, bitcast=True)
+                s = tl.dot_scaled(qpk, qsc, "e2m1", kpk, ksc, "e2m1", out_dtype=tl.float32)
+                s = s * sm_scale
+            else:
+                # fp8 x fp8 -> fp32, then the per-token scales
+                k = tl.load(K + base + offs_n[:, None] * D + offs_d[None, :],
+                            mask=nmask[:, None], other=0.0)
+                ks = tl.load(KS + off_bh * N_PAD + offs_n, mask=nmask, other=0.0)
+                s = tl.dot(q, tl.trans(k))
+                s = s * (qs[:, None] * ks[None, :]) * sm_scale
             s = tl.where(nmask[None, :], s, -1.0e30)
 
             m_new = tl.maximum(m_i, tl.max(s, 1))
@@ -171,13 +267,17 @@ if _HAS_TRITON:
             r = tl.sum(p8.to(tl.float32), 1) / P_SCALE
 
             # ---- PV with the per-block scale, then restore the block mean ---
-            # bf16 MMA, not fp8: on sm_89 with Triton 3.x, tl.dot whose *A*
-            # operand was computed in registers (rather than loaded) and is
-            # fp8 yields NaNs for every warp/stage config (QK^T with both
-            # operands from memory is fine, and torch._scaled_mm is fine).
-            # E4M3 -> bf16 is exact, so the products are identical; the cost
-            # is half the MMA rate, while V keeps its fp8 footprint in HBM.
-            tile = tl.dot(p8.to(tl.bfloat16), v.to(tl.bfloat16))
+            # fp8 PV (E4M3 x E4M3 -> fp32) on parts where the register-operand
+            # fp8 dot is correct: that doubles the MMA rate vs bf16 at identical
+            # precision, since both operands are already E4M3. On sm_89 the
+            # register fp32->e4m3 conversion is broken (probe14/15/16), so the
+            # A operand computed in registers yields wrong values; there the
+            # bf16 dot is used (E4M3 -> bf16 is exact, so the arithmetic is
+            # unchanged, at half the MMA rate).
+            if PV_FP8:
+                tile = tl.dot(p8, v)
+            else:
+                tile = tl.dot(p8.to(tl.bfloat16), v.to(tl.bfloat16))
             blk = start_n // BLOCK_N
             vs = tl.load(VS + off_bh * nb * D + blk * D + offs_d)
             mu = tl.load(MU + off_bh * nb * D + blk * D + offs_d)
@@ -339,6 +439,7 @@ def _prepare_fast(
     block_rows: int,
     hadamard: bool,
     smooth_k: bool,
+    qk_fp4: bool = False,
 ) -> Prepared:
     b, h, n, d = q.shape
     G = b * h
@@ -379,6 +480,17 @@ def _prepare_fast(
     q_scale = q_scale.reshape(G, n_pad)
     k_scale = k_scale.reshape(G, n_pad)
 
+    q4 = q4_scale = k4 = k4_scale = None
+    if qk_fp4:
+        # NVFP4 Q/K. Q packs along D (token-major); K is transposed to K-first
+        # (D//2, NP) because tl.dot_scaled wants the reduction dim on axis 0.
+        q4p, q4_scale = nvfp4_pack(q_t)
+        k4p, k4_scale = nvfp4_pack(k_t)
+        q4 = q4p.reshape(b, h, n_pad, d // 2).contiguous()
+        q4_scale = q4_scale.reshape(b, h, n_pad, d // 16).contiguous()
+        k4 = k4p.transpose(-2, -1).reshape(b, h, d // 2, n_pad).contiguous()
+        k4_scale = k4_scale.reshape(b, h, n_pad, d // 16).contiguous()
+
     if pad:
         vf = torch.nn.functional.pad(vf, (0, 0, 0, pad))
 
@@ -398,6 +510,10 @@ def _prepare_fast(
         v_scale=v_scale.reshape(b, h, nb, d).contiguous().float(),
         mu=mu_over_scale.reshape(b, h, nb, d).contiguous().float(),
         n_pad=n_pad,
+        q4=q4,
+        q4_scale=q4_scale,
+        k4=k4,
+        k4_scale=k4_scale,
     )
 
 
@@ -426,9 +542,10 @@ def vc_attention_triton(
         )
 
     try:
+        qk_fp4 = bool(cfg.qk_fp4) and q.is_cuda
         if q.is_cuda:
             p = _prepare_fast(q, k, v, perm, block_rows=cfg.block_n,
-                              hadamard=True, smooth_k=True)
+                              hadamard=True, smooth_k=True, qk_fp4=qk_fp4)
         else:
             p = prepare(q, k, v, perm, block_rows=cfg.block_n, hadamard=True)
         # The kernel indexes Out with the padded pitch (base = bh * N_PAD * D),
@@ -436,13 +553,23 @@ def vc_attention_triton(
         # mis-addresses every head after the first whenever n % block_rows != 0.
         out = torch.empty((b, h, p.n_pad, d), device=q.device, dtype=q.dtype)
         grid = (triton.cdiv(p.n_pad, cfg.block_m), b * h)
+        pv_fp8 = cfg.pv_fp8 if cfg.pv_fp8 is not None else _default_pv_fp8()
+        # When QK_FP4 is off the four fp4 slots are unused; pass the fp8 tensors
+        # so the argument list stays uniform (the loads are dead-code-eliminated).
+        q4 = p.q4 if qk_fp4 else p.q
+        q4s = p.q4_scale if qk_fp4 else p.q_scale
+        k4 = p.k4 if qk_fp4 else p.k
+        k4s = p.k4_scale if qk_fp4 else p.k_scale
         _vc_attn_fwd[grid](
             p.q, p.q_scale, p.k, p.k_scale, p.v, p.v_scale, p.mu, out,
+            q4, q4s, k4, k4s,
             scale, n, p.n_pad, d,
             BLOCK_M=cfg.block_m,
             BLOCK_N=cfg.block_n,
             EXPCAST=cfg.enable_expcast,
             BETA=cfg.expcast_beta,
+            PV_FP8=pv_fp8,
+            QK_FP4=qk_fp4,
             num_warps=cfg.num_warps,
             num_stages=cfg.num_stages,
         )

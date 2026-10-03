@@ -1,12 +1,17 @@
 """Probe 18: NVFP4 (e2m1 + per-16 e4m3 microscales) via tl.dot_scaled on sm_120.
 
-Layouts per triton 3.6 semantic.py:
-  lhs data (M, K//2) uint8 packed (low nibble first), lhs scale (M, K//16) float8e4nv
+Layouts per triton 3.6/3.8 semantic.py:
+  lhs data (M, K//2) uint8 packed (low nibble = even k), lhs scale (M, K//16) float8e4nv
   rhs data (K//2, N) uint8 packed (K along dim0!),          rhs scale (N, K//16) float8e4nv
 
   A. correctness vs exact dequant
   B. speed at QK shape vs bf16 dot -> native fp4 MMA or bf16 emulation?
   C. register-fp8 .to() dot on sm_120 (is the sm_89 cvt bug present here?)
+
+FIX vs the first draft: the dequant helpers indexed the 8-entry magnitude GRID
+with a 4-bit code (0..15, sign in bit 3) -> out-of-bounds crash. e2m1 codes must
+be split into sign (bit 3) and magnitude (bits 0..2). The _kfirst dequant also
+reshaped the (half, 2, N) stack incorrectly.
 """
 import os
 import sys
@@ -20,8 +25,15 @@ import triton.language as tl
 sys.path.insert(0, "/root/ComfyUI/custom_nodes/comfyui_vc_attention")
 from vc_attention import quant as Q
 
-print(f"triton {triton.__version__}  {torch.cuda.get_device_name(0)}")
+print(f"triton {triton.__version__}  torch {torch.__version__}  {torch.cuda.get_device_name(0)}", flush=True)
 GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device="cuda")
+
+
+def _nib_val(codes):
+    """4-bit e2m1 codes (sign in bit 3) -> float values."""
+    c = codes.to(torch.int64) & 0xF
+    sign = torch.where((c & 0x8) != 0, -1.0, 1.0)
+    return GRID[c & 0x7] * sign
 
 
 def nvfp4_quant(x):
@@ -32,11 +44,9 @@ def nvfp4_quant(x):
     micro_code = Q.e4m3_encode((amax / 6.0).reshape(R, K // 16))
     micro_val = Q.e4m3_decode(micro_code).clamp(min=1e-30)
     q = (xb / micro_val.unsqueeze(-1)).clamp(-6, 6)
-    codes = Q.fp4_encode(q).to(torch.uint8)           # (R, K) nibbles
+    codes = Q.fp4_encode(q).to(torch.uint8).reshape(R, K)   # (R, K) 4-bit codes
     packed = (codes[:, 0::2] & 0xF) | ((codes[:, 1::2] & 0xF) << 4)
     return packed, micro_code
-
-
 
 
 def nvfp4_quant_kfirst(w):
@@ -48,28 +58,30 @@ def nvfp4_quant_kfirst(w):
     micro_val = Q.e4m3_decode(micro_code).reshape(K // 16, 1, N).clamp(min=1e-30)
     q = (xb / micro_val).clamp(-6, 6)
     codes = Q.fp4_encode(q).to(torch.uint8).reshape(K // 16, 16, N)
-    lo = codes[:, 0::2, :]
+    lo = codes[:, 0::2, :] & 0xF
     hi = (codes[:, 1::2, :] & 0xF) << 4
     packed = (lo | hi).reshape(K // 2, N)
     return packed, micro_code
 
 
-def nvfp4_dequant_kfirst(packed, micro_code):
-    K, N = packed.shape
-    lo = (packed & 0xF).long()
-    hi = ((packed >> 4) & 0xF).long()
-    v = torch.stack([GRID[lo], GRID[hi]], dim=-1).reshape(K // 2, 2, N).reshape(K, N)
-    micro = Q.e4m3_decode(micro_code).repeat_interleave(16, dim=0)
-    return v * micro
-
-
 def nvfp4_dequant(packed, micro_code):
+    """packed (R, K//2), micro (R, K//16) -> (R, K)."""
     R, half = packed.shape
-    lo = (packed & 0xF).long()
-    hi = ((packed >> 4) & 0xF).long()
-    v = torch.stack([GRID[lo], GRID[hi]], dim=-1).reshape(R, half * 2)
+    lo = packed & 0xF
+    hi = (packed >> 4) & 0xF
+    v = torch.stack([_nib_val(lo), _nib_val(hi)], dim=2).reshape(R, half * 2)
     micro = Q.e4m3_decode(micro_code).repeat_interleave(16, dim=1)
     return v * micro[:, : v.shape[1]]
+
+
+def nvfp4_dequant_kfirst(packed, micro_code):
+    """packed (K//2, N), micro (K//16, N) -> (K, N)."""
+    half, N = packed.shape
+    lo = packed & 0xF
+    hi = (packed >> 4) & 0xF
+    v = torch.stack([_nib_val(lo), _nib_val(hi)], dim=1).reshape(half * 2, N)
+    micro = Q.e4m3_decode(micro_code).repeat_interleave(16, dim=0)
+    return v * micro
 
 
 @triton.jit
@@ -137,19 +149,23 @@ M0, N0, K0 = 256, 256, 128
 x = torch.randn(M0, K0, device="cuda") * 0.5
 w = torch.randn(N0, K0, device="cuda") * 0.5          # (N, K) row-major tokens
 ac, asc = nvfp4_quant(x)
-bc, bsc = nvfp4_quant_kfirst(w)              # (K, N) -> K-first packing
+bc, bsc = nvfp4_quant_kfirst(w.t().contiguous())       # (K, N) -> K-first packing
 out = run_nvfp4(ac, asc, bc, bsc, M0, N0, K0)
 ref = nvfp4_dequant(ac, asc) @ nvfp4_dequant_kfirst(bc, bsc)
 rel = float((out - ref).abs().max() / ref.abs().mean().clamp(min=1e-9))
 print(f"A NVFP4 correctness: max|diff|={float((out-ref).abs().max()):.4f} rel={rel:.4f} "
-      f"finite={bool(torch.isfinite(out).all())}")
+      f"finite={bool(torch.isfinite(out).all())}", flush=True)
+
+# A2. sanity: quant round-trip error vs exact (proves the encoder, independent of MMA)
+rt = nvfp4_dequant(ac, asc)
+print(f"A2 quant round-trip: rel_err={float((rt - x).norm()/x.norm()):.4f}", flush=True)
 
 # B. speed at QK shape
 M, N, K = 8192, 8192, 128
 x = torch.randn(M, K, device="cuda") * 0.5
 w = torch.randn(N, K, device="cuda") * 0.5
 ac, asc = nvfp4_quant(x)
-bc, bsc = nvfp4_quant_kfirst(w)
+bc, bsc = nvfp4_quant_kfirst(w.t().contiguous())
 xd = nvfp4_dequant(ac, asc).to(torch.bfloat16)
 wd = nvfp4_dequant_kfirst(bc, bsc).to(torch.bfloat16).T.contiguous()
 
@@ -159,7 +175,7 @@ t16 = bench(lambda: _dot_bf16[(triton.cdiv(M, 128), triton.cdiv(N, 128))](
     xd, wd, outb, M, N, K, BM=128, BN=128, num_warps=8))
 fl = 2 * M * N * K / 1e12
 print(f"B speed ({M}x{K}x{N}): NVFP4 {t4:7.2f} ms ({fl/t4*1000:6.1f} TFLOP/s)  "
-      f"bf16 {t16:7.2f} ms ({fl/t16*1000:6.1f} TFLOP/s)  ratio {t16/t4:.2f}x")
+      f"bf16 {t16:7.2f} ms ({fl/t16*1000:6.1f} TFLOP/s)  ratio {t16/t4:.2f}x", flush=True)
 
 # C. register-fp8 dot on sm_120 (sm_89 had the cvt bug)
 a32 = torch.rand(128, 128, device="cuda")
@@ -171,4 +187,4 @@ torch.cuda.synchronize()
 refc = a8.float() @ b8.float()
 err = float((outc - refc).abs().max())
 print(f"C register-fp8 dot on sm_120: max|diff|={err:.4f} -> "
-      f"{'BROKEN (keep bf16 PV)' if err > 1.0 else 'OK (fp8 PV possible!)'}")
+      f"{'BROKEN (keep bf16 PV)' if err > 1.0 else 'OK (fp8 PV possible!)'}", flush=True)

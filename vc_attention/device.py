@@ -73,10 +73,17 @@ class DeviceProfile:
             )
         if self.sm == (12, 0):
             return (
-                "Blackwell workstation: the paper's NVFP4 target (kernel "
-                "2.3-3.6x, end-to-end 1.36-1.70x). NOTE: this port's kernel "
-                "currently implements the FP8 path only - the NVFP4 branch is "
-                "not written yet, so the node runs FP8 here today."
+                "Blackwell workstation (RTX 50xx / RTX PRO). Measured here on an "
+                "RTX 5090 (Triton 3.8, torch 2.10/cu130, 16384 tokens, 56 heads, "
+                "D=128): fp8 PV doubles the PV MMA rate and is exactly as "
+                "accurate, taking the fused kernel from 51.7 ms (bf16 PV) to "
+                "25.0 ms -> 2.07x on the kernel, 1.06x end-to-end vs bf16 SDPA. "
+                "NVFP4 QK^T works (dot_scaled, 530 TFLOP/s) but is a NET LOSS "
+                "for attention: the kernel gains only 1.23x (the QK reduction is "
+                "just D=128, not a long GEMM) while host-side NVFP4 quantization "
+                "costs ~23 ms/layer (PyTorch 2.10 has no float->fp4 cast) and "
+                "QK^T error rises 3.6%->13.4% (attn PSNR 57.4->47.2 dB). So the "
+                "default here is fp8; nvfp4 is opt-in via backend='nvfp4'."
             )
         return (
             "no low-bit tensor cores detected: the node will defer to native "
@@ -110,7 +117,12 @@ def detect_profile(device: Optional[torch.device] = None) -> DeviceProfile:
     softmax_bound = has_fp8 and not has_fp4
 
     if has_fp4:
-        return DeviceProfile(name, sm, has_fp8, True, False, 4, False)
+        # Workstation Blackwell (sm_120) measured: the NVFP4 QK path is a net
+        # loss for attention (host quantisation costs more than the kernel
+        # gains), so recommend 8-bit there. Datacenter Blackwell keeps the
+        # paper's 4-bit recommendation (not verified on these parts here).
+        rec = 8 if sm == (12, 0) else 4
+        return DeviceProfile(name, sm, has_fp8, True, False, rec, False)
     if has_fp8:
         return DeviceProfile(name, sm, True, False, True, 8, True)
     return DeviceProfile(name, sm, False, False, False, 8, False)

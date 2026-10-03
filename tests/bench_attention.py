@@ -112,7 +112,7 @@ def main():
         repeat=max(2, args.repeat // 2),
     )
 
-    tcfg = TritonConfig(block_m=128, block_n=args.block_rows)
+    tcfg = TritonConfig(block_m=64, block_n=args.block_rows)
     out = vc_attention_triton(q, k, v, perm=perm, cfg=tcfg)
     t_vc = timeit(lambda: vc_attention_triton(q, k, v, perm=perm, cfg=tcfg),
                   repeat=args.repeat)

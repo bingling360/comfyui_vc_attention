@@ -64,7 +64,7 @@ class VCAttentionConfig:
     enable_vsmooth: bool = True
     enable_expcast: bool = False     # 8-bit datacenter only; see expcast.py
     block_rows: int = 128            # == H3 attention_head_dim
-    block_m: int = 128
+    block_m: int = 64                # tuned on sm_120 (see TritonConfig)
     min_tokens: int = 8192
     hadamard: bool = True
     smooth_k: bool = True
@@ -210,6 +210,14 @@ class VCAttentionRuntime:
             block_m=cfg.block_m,
             block_n=cfg.block_rows,
             enable_expcast=bool(cfg.enable_expcast and self.backend == "fp8"),
+            # "nvfp4" additionally moves QK^T onto the FP4 tensor cores. On
+            # sm_120 that is a *net loss* for attention: the kernel gets 1.23x
+            # faster but host-side NVFP4 quantization costs ~23 ms per layer
+            # (no native float->fp4 cast exists) and QK fidelity drops ~10 dB.
+            # Kept selectable because the paper specifies it and the tradeoff
+            # depends on the sequence shape; see tests/bench_pv.py.
+            pv_fp8=(True if self.backend == "nvfp4" else None),
+            qk_fp4=(self.backend == "nvfp4"),
         )
         return vc_attention_triton(q, k, v, perm=perm, cfg=tcfg, scale=scale)
 

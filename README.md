@@ -58,9 +58,11 @@ you want to exercise the algorithm anyway.)
 ## Use in ComfyUI
 
 Add **VC Attention (MiniMax-H3)** between the model loader and the sampler.
-Defaults are already set for H3; `backend=auto` picks NVFP4 on RTX 50xx /
-RTX PRO 6000 and FP8 elsewhere. Add **VC Attention Disable** after sampling to
-restore the original attention.
+Defaults are already set for H3; `backend=auto` picks FP8 on every card this
+port has measured — on RTX 50xx that is a deliberate choice, not a limitation:
+the FP4 path works but loses end to end there (see "The FP4 question" below).
+`backend="nvfp4"` opts into NVFP4 QK^T anyway. Add **VC Attention Disable** after
+sampling to restore the original attention.
 
 Watch the console on install — it prints the detected GPU, the resolved backend
 and whether the fused kernel is actually live.
@@ -193,9 +195,51 @@ Verified here on CPU (torch 2.14, `tests/`, 73 assertions):
   a tuned kernel. The k-means permutation is amortised (46 ms per step-window
   over 50 layers at 32K tokens). A silent fallback now prints to stderr.
 
+- **Verified on an RTX 5090 (sm_120, Triton 3.8, torch 2.10/cu130), 2026-10-03.**
+  The two things that blocked a speedup on Ada both clear on Blackwell:
+
+  1. **The register-operand fp8 PV dot is correct on sm_120** (the sm_89
+     fp32→e4m3 conversion bug is absent — `_probe19`, max|diff| = 0.0). Since
+     both PV operands are already E4M3, this doubles the PV MMA rate at
+     *identical* precision. Kernel: **51.7 ms → 25.0 ms (2.07×)** at 16K
+     tokens; PSNR unchanged at 57.40 dB.
+  2. **Launch config matters a lot**: `BLOCK_M=64, num_warps=4, num_stages=2`
+     beats the old `128/8/3` by 1.27×. `BLOCK_M=256` with 4 warps spills
+     catastrophically (966 ms). These are now the defaults.
+
+  End-to-end at 16384 tokens / 56 heads / D=128 (auto backend → fp8):
+
+  | | bf16 SDPA | VC-Attention | ratio | PSNR |
+  |---|---|---|---|---|
+  | RTX 5090, after these fixes | 35.2 ms | **32.7 ms** | **1.08×** | 56.6 dB |
+  | RTX 5090, before (bf16 PV) | 35.2 ms | 59.9 ms | 0.59× | 57.4 dB |
+
+- **NVFP4 for attention: works, but does not pay off on sm_120.** `tl.dot_scaled`
+  with e2m1 + per-16 e4m3 microscales *is* native FP4 hardware on sm_120, not
+  emulation — in a compute-bound GEMM (K=4096) it runs at **530 TFLOP/s vs 277
+  for fp8 and 139 for bf16 (3.82×)**. But attention is the wrong shape for it:
+
+  | | prepare | kernel | total | PSNR |
+  |---|---|---|---|---|
+  | fp8 QK + bf16 PV | 8.2 ms | 51.7 ms | 59.9 ms | 57.40 dB |
+  | fp8 QK + fp8 PV | 8.2 ms | **25.0 ms** | **33.2 ms** | 57.40 dB |
+  | fp4 QK + fp8 PV | **31.3 ms** | 20.2 ms | 51.5 ms | 47.19 dB |
+
+  QK^T's reduction is only `D=128` (not a long GEMM), so FP4 buys just 1.23×
+  there, while host-side NVFP4 quantization costs ~23 ms/layer — PyTorch 2.10
+  has no `float → float4_e2m1fn_x2` cast, so the codes come from 7 elementwise
+  comparisons (the e4m3 microscale does use the native cast). And the 2-bit
+  mantissa costs ~10 dB: QK^T relative error 3.6% → 13.4%. PV *cannot* use FP4
+  at all, because its A operand (the softmax probabilities) is computed in
+  registers and `dot_scaled` needs packed operands from memory.
+
+  So on sm_120 the default is **fp8**; `backend="nvfp4"` selects the FP4 QK path
+  for anyone who wants the paper's 4-bit configuration or is on a shape where
+  the tradeoff flips. This is what `tests/bench_pv.py` and `_probe18/19/20` measure.
+
 - All speed figures besides the ones above. The paper's speedups additionally
-  rely on fp8 PV (blocked here by the Triton bug above) and ExpCast-FP8
-  (softmax-stage shortening), neither of which is active on this card.
+  rely on ExpCast-FP8 (softmax-stage shortening), which is inactive on
+  workstation cards.
 - ExpCast-FP8 branch: compiles (shares the fixed PV call site) but was never
   exercised — it targets 8-bit datacenter cards.
 - Real MiniMax-H3 weights. The PSNR figures above come from synthetic tensors
@@ -245,7 +289,7 @@ vc_attention/
   patch.py       installs the attention hook and step counter
   kernels/
     reference.py portable oracle (defines the semantics)
-    triton_attn.py fused fp8 kernel (fast path, unverified)
+    triton_attn.py fused fp8 kernel (fast path; fp8 PV default, opt-in NVFP4 QK)
 nodes.py         ComfyUI node
 tests/
   test_quant.py          32 assertions, CPU  (formats + ExpCast)
@@ -253,6 +297,11 @@ tests/
   test_install.py        21 assertions, CPU  (hook, schedule, fallback, node.apply)
   test_prepare.py        12 assertions, CPU  (kernel input layout)
   bench_attention.py     speed + PSNR, needs CUDA
+  bench_pv.py            prepare/kernel split, backend matrix, needs CUDA
+  tune_attn.py           launch-config sweep, needs CUDA
+  _probe14/15/16.py      sm_89 register-fp8 cvt bug repros
+  _probe18/19_nvfp4.py   NVFP4 dot_scaled layouts + compute-bound GEMM bench
+  _probe20_qkquant.py    fp8 vs NVFP4 Q/K fidelity
   _diag_decomp.py        error decomposition scratch script
 ```
 
