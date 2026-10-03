@@ -207,12 +207,30 @@ Verified here on CPU (torch 2.14, `tests/`, 73 assertions):
      beats the old `128/8/3` by 1.27×. `BLOCK_M=256` with 4 warps spills
      catastrophically (966 ms). These are now the defaults.
 
-  End-to-end at 16384 tokens / 56 heads / D=128 (auto backend → fp8):
+  End-to-end on an RTX 5090 (auto backend → fp8), 56 heads, D=128. The
+  `bf16 SDPA` baseline is the *same* FlashAttention backend the paper compares
+  against — PyTorch's default SDPA dispatch measures 35.17 ms vs 35.23 ms for
+  an explicit `SDPBackend.FLASH_ATTENTION` at 16K tokens (555.4 vs 555.3 ms at
+  64K), i.e. it *is* FA, not a fallback:
 
-  | | bf16 SDPA | VC-Attention | ratio | PSNR |
-  |---|---|---|---|---|
-  | RTX 5090, after these fixes | 35.2 ms | **32.7 ms** | **1.08×** | 56.6 dB |
-  | RTX 5090, before (bf16 PV) | 35.2 ms | 59.9 ms | 0.59× | 57.4 dB |
+  | Tokens | bf16 SDPA (=FA) | VC-Attention | ratio | PSNR | V-Smooth gain |
+  |---|---|---|---|---|---|
+  | 16384 | 35.1 ms | 32.7 ms | **1.07×** | 57.5 dB | +0.17 dB |
+  | 32768 | 139.6 ms | 115.4 ms | **1.21×** | 56.0 dB | +0.11 dB |
+  | 65536 | 557.1 ms | 431.9 ms | **1.29×** | 56.2 dB | +0.08 dB |
+
+  The ratio climbs with length because `prepare` is linear while attention is
+  quadratic; H3's real ~63K-token sequences sit at the 1.29× end. **The kernel
+  alone is ~1.4×** (the rest is the 8.2 ms prepare at 16K, ~33 ms at 64K).
+
+  **This does not reach the paper's RTX 5090 claim (kernel 2.3–3.6×, end-to-end
+  1.36–1.70×), and the reason is specific and measured.** Both of our matmuls
+  run at fp8 = 2× the bf16 MMA rate; the paper's number requires the *4-bit*
+  path = 4×. On this stack the 4-bit path is unreachable: FP4 QK^T is a net
+  loss (host quantisation, above) and FP4 PV is impossible in principle (the
+  softmax probabilities are a register operand). With the matmuls capped at 2×
+  and roughly a third of kernel time being softmax/epilogue, ~1.4–1.5× kernel
+  is the ceiling here — consistent with what we measure.
 
 - **NVFP4 for attention: works, but does not pay off on sm_120.** `tl.dot_scaled`
   with e2m1 + per-16 e4m3 microscales *is* native FP4 hardware on sm_120, not
