@@ -79,6 +79,17 @@ class VCAttentionMiniMaxH3:
                                     "tooltip": "Use the H3 modality tag as the primary sort "
                                                "key. Measured slightly worse than plain label "
                                                "sorting; left off by default."}),
+                "override_priority": (["defer", "front"],
+                                      {"default": "defer",
+                                       "tooltip": "What to do when another attention backend "
+                                                  "already owns the override chain (Comfy "
+                                                  "Kitchen's backend node, Sol-Attn). 'defer' "
+                                                  "leaves it alone and VC-Attention stays out; "
+                                                  "'front' chains in front so VC-Attention "
+                                                  "takes the calls it supports. Measured on "
+                                                  "sm_120: taking priority over Kitchen INT8 "
+                                                  "is 0.34x (3x SLOWER), so only pick 'front' "
+                                                  "if VC-Attention is your fastest backend."}),
             },
         }
 
@@ -108,6 +119,7 @@ class VCAttentionMiniMaxH3:
         reuse_every=4,
         kmeans_iters=3,
         modality_aware=False,
+        override_priority="defer",
     ):
         profile = detect_profile()
         resolved = resolve_backend(backend, profile)
@@ -125,6 +137,7 @@ class VCAttentionMiniMaxH3:
             group_fraction=float(group_fraction),
             reuse_every=int(reuse_every),
             total_steps_hint=int(total_steps),
+            override_priority=str(override_priority),
         )
         runtime = install(cfg, model=model)
         runtime.reset()

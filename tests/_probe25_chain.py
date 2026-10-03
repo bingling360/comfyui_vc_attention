@@ -44,7 +44,8 @@ model = FakePatcher()
 model.model_options["transformer_options"]["optimized_attention_override"] = \
     lambda _, *a, **kw: counting_kitchen(*a, **kw)
 
-rt = P.install(P.VCAttentionConfig(backend="fp8", block_rows=128, block_m=64), model=model)
+rt = P.install(P.VCAttentionConfig(backend="fp8", block_rows=128, block_m=64,
+                                   override_priority="front"), model=model)
 t_opts = model.model_options["transformer_options"]
 print("chain installed:", "optimized_attention_override" in t_opts, flush=True)
 print("chain has prev :", hasattr(t_opts["optimized_attention_override"], "_vc_prev"), flush=True)

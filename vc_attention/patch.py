@@ -83,6 +83,19 @@ class VCAttentionConfig:
     # Set this to True only to exercise the algorithm itself.
     allow_slow_fallback: bool = False
 
+    # What to do when another backend already owns
+    # transformer_options["optimized_attention_override"] -- Comfy Kitchen's
+    # backend node, or Sol-Attn's generic node:
+    #   "defer" -> leave it alone and stay out of the chain (default)
+    #   "front" -> chain in front, so VC-Attention handles the calls it supports
+    #             and the other backend gets the rest
+    # Measured on sm_120 (tests/_probe27_stack_gain.py, 16384 tokens, 56 heads):
+    #   Kitchen alone 13.4 ms | VC in front 39.6 ms (0.34x) | Kitchen in front 13.6 ms
+    # VC-Attention's kernel is the slowest of the three, so "front" is a 3x
+    # REGRESSION unless VC-Attention is genuinely the fastest backend you have.
+    # "front" only makes sense once the kernel is competitive.
+    override_priority: str = "defer"
+
     supported_head_dims: tuple = (64, 128)
 
 
@@ -295,7 +308,8 @@ def _try_vc(runtime: "VCAttentionRuntime", q, k, v, heads: int, mask=None,
     return out if skip_output_reshape else out.transpose(1, 2).reshape(b, n, heads * d)
 
 
-def install_attention_override(runtime: "VCAttentionRuntime", model: Any) -> bool:
+def install_attention_override(runtime: "VCAttentionRuntime", model: Any,
+                               priority: Optional[str] = None) -> bool:
     """Register VC-Attention in ComfyUI's ``optimized_attention_override`` chain.
 
     Monkey-patching ``optimized_attention`` puts VC-Attention *outside* the
@@ -308,6 +322,14 @@ def install_attention_override(runtime: "VCAttentionRuntime", model: Any) -> boo
         prev = transformer_options["optimized_attention_override"]
         new  = lambda func, *a, **kw: vc(a, kw) or (prev or func)(func, *a, **kw)
 
+    Whether that is *worth* doing depends on VC-Attention being the faster
+    backend, so ``priority`` (default ``config.override_priority``) decides:
+
+      * ``"defer"`` (default) -- if another backend is already installed, leave
+        it alone and do not enter the chain. Measured on sm_120 this is the
+        right call: Kitchen INT8 does 13.4 ms where we do 39.6 ms.
+      * ``"front"`` -- chain in front and take the calls VC-Attention supports.
+
     Returns True when the chain entry was installed.
     """
     try:
@@ -316,6 +338,17 @@ def install_attention_override(runtime: "VCAttentionRuntime", model: Any) -> boo
         return False
 
     prev = opts.get("optimized_attention_override")
+    priority = priority or runtime.config.override_priority
+
+    if prev is not None and priority != "front":
+        _notify_once(
+            "another attention backend already owns attention "
+            "(`optimized_attention_override`) -> VC-Attention stays out. Set "
+            "override_priority='front' to take priority instead, but only if "
+            "VC-Attention is the fastest backend you have (measured: taking "
+            "priority over Comfy Kitchen INT8 is 0.34x, i.e. 3x slower)."
+        )
+        return False
 
     def override(func, *args, **kwargs):
         try:

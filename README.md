@@ -251,15 +251,29 @@ Verified here on CPU (torch 2.14, `tests/`, 73 assertions):
   survive on this stack. Treat this port on sm_120 as a correctness reference,
   not a speedup — and use Kitchen or Sol-Attn for actual sampling.
 
-- **Composing with other backends.** Monkey-patching `optimized_attention` puts
-  this node *outside* ComfyUI's dispatch, so any node registering an
-  `optimized_attention_override` (Kitchen's backend node, Sol-Attn's generic
-  node) silently shadowed it — measured in `tests/_probe21_kitchen.py`. Passing
-  `model=` to `install()` now also enters that chain, wrapping whatever was
-  already there as the fallback, exactly as Sol-Attn does. VC-Attention then
-  handles the calls it supports and defers the rest (short sequences, other
-  head dims) to the other backend; node order decides priority. Verified in
-  `tests/_probe25_chain.py`.
+- **Composing with other backends — and why it buys nothing here.** Monkey-
+  patching `optimized_attention` put this node *outside* ComfyUI's dispatch, so
+  any node registering an `optimized_attention_override` (Kitchen's backend
+  node, Sol-Attn's generic node) silently shadowed it (`tests/_probe21_kitchen.py`).
+  `install(model=...)` can now enter that chain and wrap the existing backend as
+  its fallback, exactly as Sol-Attn does — but **chaining only helps if you are
+  the faster backend**, and measured on sm_120 we are not
+  (`tests/_probe27_stack_gain.py`, 16384 tokens):
+
+  | configuration | time | vs Kitchen alone |
+  |---|---|---|
+  | Kitchen alone | 13.40 ms | 1.00× |
+  | + VC-Attention taking priority (`override_priority="front"`) | 39.52 ms | **0.34× (3× slower)** |
+  | + VC-Attention deferring (`override_priority="defer"`, default) | 13.59 ms | 0.99× |
+  | VC first, Kitchen node second | 13.67 ms | 0.98× |
+
+  So `override_priority` defaults to **`"defer"`**: when another backend already
+  owns attention, VC-Attention stays out rather than preempting it. `"front"`
+  is available and is the right setting once the kernel is competitive — today
+  it is a 3× regression against Kitchen. **There is no speedup to be had from
+  stacking on this GPU**; the only honest combination would be a fused kernel
+  (Sol's block routing × our quantisation), which `tests/_probe22_solstack.py`
+  shows is numerically free but is a kernel merge, not a node graph.
 
 - **NVFP4 for attention: works, but does not pay off on sm_120.** `tl.dot_scaled`
   with e2m1 + per-16 e4m3 microscales *is* native FP4 hardware on sm_120, not
