@@ -64,8 +64,14 @@ the FP4 path works but loses end to end there (see "The FP4 question" below).
 `backend="nvfp4"` opts into NVFP4 QK^T anyway. Add **VC Attention Disable** after
 sampling to restore the original attention.
 
-Watch the console on install — it prints the detected GPU, the resolved backend
-and whether the fused kernel is actually live.
+`enable_sparsity` is **on by default**: Sol-Attn-style block skipping is fused
+into the same kernel and is what makes this node faster than Comfy Kitchen INT8
+(1.80× at 64K tokens). It is the one setting with an unverified quality cost —
+read "Fused block sparsity" below before using it for real work, and set
+`enable_sparsity=false` for the pure quantisation path.
+
+Watch the console on install — it prints the detected GPU, the resolved backend,
+the sparsity settings and whether the fused kernel is actually live.
 
 ## Use from Python
 
@@ -76,6 +82,8 @@ install(VCAttentionConfig(
     backend="auto",        # nvfp4 on Blackwell workstation, fp8 elsewhere
     enable_vsmooth=True,
     enable_expcast=False,  # 8-bit datacenter only
+    enable_sparsity=True,  # fused Sol-Attn-style block skipping
+    tau=1.3,               # sparsity threshold (larger = faster, lower quality)
     block_rows=128,        # == H3 attention_head_dim
     total_steps_hint=8,    # H3 distilled LoRA
 ), model=model_patcher)
@@ -272,29 +280,26 @@ Verified here on CPU (torch 2.14, `tests/`, 73 assertions):
   survive on this stack. Treat this port on sm_120 as a correctness reference,
   not a speedup — and use Kitchen or Sol-Attn for actual sampling.
 
-- **Composing with other backends — and why it buys nothing here.** Monkey-
-  patching `optimized_attention` put this node *outside* ComfyUI's dispatch, so
-  any node registering an `optimized_attention_override` (Kitchen's backend
-  node, Sol-Attn's generic node) silently shadowed it (`tests/_probe21_kitchen.py`).
-  `install(model=...)` can now enter that chain and wrap the existing backend as
-  its fallback, exactly as Sol-Attn does — but **chaining only helps if you are
-  the faster backend**, and measured on sm_120 we are not
-  (`tests/_probe27_stack_gain.py`, 16384 tokens):
+- **Composing with other backends.** Monkey-patching `optimized_attention` put
+  this node *outside* ComfyUI's dispatch, so any node registering an
+  `optimized_attention_override` (Kitchen's backend node, Sol-Attn's generic
+  node) silently shadowed it (`tests/_probe21_kitchen.py`). `install(model=...)`
+  enters that chain and wraps the existing backend as its fallback, exactly as
+  Sol-Attn does. Whether that helps depends on being the faster backend, and the
+  answer changed when block sparsity was fused into the kernel
+  (`tests/_probe35_phase3.py` + `tests/_probe26_kitchen_time.py`):
 
-  | configuration | time | vs Kitchen alone |
+  | configuration | 16384 tokens | 65536 tokens |
   |---|---|---|
-  | Kitchen alone | 13.40 ms | 1.00× |
-  | + VC-Attention taking priority (`override_priority="front"`) | 39.52 ms | **0.34× (3× slower)** |
-  | + VC-Attention deferring (`override_priority="defer"`, default) | 13.59 ms | 0.99× |
-  | VC first, Kitchen node second | 13.67 ms | 0.98× |
+  | Kitchen alone | 13.45 ms | 202.1 ms |
+  | VC-Attention in front, dense (fp8) | 32.9 ms (0.41×) | 432 ms (0.47×) |
+  | VC-Attention in front, sparse τ=1.3 | 15.0 ms (0.90×) | **112.3 ms (1.80×)** |
 
-  So `override_priority` defaults to **`"defer"`**: when another backend already
-  owns attention, VC-Attention stays out rather than preempting it. `"front"`
-  is available and is the right setting once the kernel is competitive — today
-  it is a 3× regression against Kitchen. **There is no speedup to be had from
-  stacking on this GPU**; the only honest combination would be a fused kernel
-  (Sol's block routing × our quantisation), which `tests/_probe22_solstack.py`
-  shows is numerically free but is a kernel merge, not a node graph.
+  So `override_priority` now defaults to **`"front"`**: at H3's real (~63K
+  token) length the fused kernel wins. At 16K it is ~11% behind Kitchen, so
+  `"defer"` remains the right setting for short-sequence work. Note that this is
+  a *single* fused kernel, not two nodes stacked — two attention nodes on one
+  call site is pure overhead (0.98–0.99×, `tests/_probe27_stack_gain.py`).
 
 - **NVFP4 for attention: works, but does not pay off on sm_120.** `tl.dot_scaled`
   with e2m1 + per-16 e4m3 microscales *is* native FP4 hardware on sm_120, not
@@ -354,6 +359,85 @@ Also: without the Q/K Hadamard rotation *and* per-token (not per-channel) key
 quantisation, the QK term is 55% relative output error versus ~1.5% for V, and
 no amount of V smoothing is visible end to end. Per-token key quantisation
 brings it to 3.6%. Both are on by default.
+
+---
+
+## Fused block sparsity (Sol-Attn style)
+
+**Two nodes cannot be stacked.** Attention overrides compete for the same call
+site, so adding Sol-Attn next to this node measures 0.98–0.99× — pure overhead
+(`tests/_probe27_stack_gain.py`). Sparsity and quantisation are *orthogonal*
+axes, though: one skips work, the other makes work cheaper, and they compose
+numerically (stacking costs ≤0.03 dB, `tests/_probe22_solstack.py`). So the only
+combination that can pay is both inside one kernel, and that is what
+`sparse=True` does.
+
+**How it works** (`kernels/triton_attn.py::_vc_attn_fwd_sparse`). KV blocks are
+walked a `group=16` at a time:
+
+1. one tensor-core matmul `q @ kc^T` gives the per-row proxy score against every
+   block's mean key in the group;
+2. the group's row-mean proxy is compared with a host-side threshold
+   `mean + tau·std` (computed from a pooled query centroid, `_prepare_fast`);
+3. blocks below the threshold are **approximated, not dropped** — their proxy
+   score is reused for the whole block against the block-mean value, so the
+   softmax normaliser stays right. One small matmul folds the whole group in;
+4. blocks above it run the exact quantised tile.
+
+The approximation and the routing both run on tensor cores. That matters: the
+first attempt computed the proxy and the approximation per tile with fp32
+elementwise ops, which cost ~45% of the dense kernel and made skipping
+pointless — measured *slower* than not skipping at all.
+
+**Measured** (RTX 5090, sm_120, 56 heads, D=128, `h3_like` data,
+`tests/_probe35_phase3.py` + `tests/_probe26_kitchen_time.py`):
+
+| tokens | bf16 FlashAttention | Comfy Kitchen INT8 | VC dense (fp8) | **VC sparse τ=1.3** |
+|---|---|---|---|---|
+| 16384 | 35.4 ms (1.00×) | 13.45 ms (2.63×) | 32.9 ms (1.08×) | **15.0 ms (2.36×)** |
+| 65536 | 559 ms (1.00×) | 202 ms (2.77×) | 432 ms (1.29×) | **112 ms (4.98×)** |
+
+At H3's real sequence length (~63K tokens) the fused kernel is **1.80× faster
+than Comfy Kitchen INT8**. At 16K it is ~11% behind Kitchen. Keep ratio at
+τ=1.3 is ~12%; the τ sweep (`0.8 → 23%`, `1.0 → 18%`, `2.0 → 5%`) is in the
+probe output.
+
+**Verification.** `SPARSE=False` is a *separate* kernel, so the dense path is
+untouched (G2). With every block forced exact (`tau=-1000`, `local=1e5`,
+`sink=1e5`) the sparse kernel reproduces the dense kernel **bit for bit**
+(rel-err `0.000e+00`, `tests/_probe33_sparse_isolate.py`). Against an independent
+PyTorch simulation of the same algorithm on the same quantised operands, PSNR
+agrees to 0.01 dB at every τ (`tests/_probe35_phase3.py`).
+
+**Quality: read this before enabling it.** On the synthetic `h3_like`
+benchmark the sparse path drops ~20 dB of PSNR against dense attention — at
+*every* τ. That number is **not** a valid measure of the real quality loss: the
+synthetic keys inside a 128-token block are near-orthogonal, so the block-mean
+proxy is a poor stand-in and skipped blocks contribute almost nothing. It is
+also not specific to this port — the independent fp32 Sol-Attn simulation of the
+same rule scores *worse* (31.8 dB) than this kernel (35.5 dB) on the same data.
+Real keys are correlated within a block, which is exactly the premise the
+algorithm relies on. **End-to-end H3 image/video validation has not been run
+here** and is the one gate this change has not passed. If you enable sparsity,
+compare a dense and a sparse render first; raise `tau` or set
+`enable_sparsity=false` if it degrades.
+
+**Knobs** (`VC Attention (MiniMax-H3)` node):
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `enable_sparsity` | `true` | off = pure quantisation path |
+| `tau` | `1.3` | Sol-Attn's tuned value; larger = faster, lower quality |
+| `sparsity_min_tokens` | `8192` | below this, sparsity is off |
+| `sink_tokens` | `512` | leading tokens kept exact (H3 packs text/conditioning there) |
+| `local_blocks` | `1` | ±N KV blocks around each query block kept exact |
+| `override_priority` | `front` | take priority over another backend node |
+
+`override_priority` defaulted to `defer` while this kernel was slower than
+Comfy Kitchen INT8 (taking priority was then a 3× regression). Now that the
+fused version wins at H3's length it defaults to `front` — that is what makes
+the node take effect next to a Kitchen backend node. Set `defer` if you work at
+short sequence lengths.
 
 ---
 

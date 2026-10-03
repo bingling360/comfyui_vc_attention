@@ -316,3 +316,83 @@ row_sum += tl.sum(approximate_probability * lengths, 1)
 - `override_priority` 的默认值只在 Phase 3 实测「融合版快于 Kitchen」之后才改为
   `"front"`；否则保持 `"defer"`。
 
+---
+
+## 11. Phase 2 返工完成 + Phase 3 实测（2026-10-04 03:xx）
+
+### Phase 2 返工 — 完成 ✅（根因与修法）
+
+**根因不是「代理分算法」，是「把 Sol 的批处理拆成了逐 tile 的 fp32 逐元素运算」。**
+
+1. **代理分开销**：`q.to(fp32) * km[None,:]` 每个 tile materialize 一个 (64,128) fp32
+   临时张量 → 全保留时 32.4 → 41.2 ms（+27%）。
+2. **近似路径才是真正的大头**：逐 tile 的 `p_row ⊗ (BLOCK_N·vm)` 是 fp32 逐元素
+   (64,128) 更新，实测吃掉稠密 kernel 的 ~45%。所以「跳过」根本不省时间：
+   tau=0（keep 50%）与 tau=1.3（keep 12%）耗时**完全相同**（29.06 vs 28.94 ms）。
+   —— 这解释了 probe32/34 里「结果与 tau 无关」的假象。
+3. **归一化 bug（重要）**：近似路径的分子漏了 block 长度因子（分母有），
+   与 Sol 的写法一致但和「块均值 V」不自洽，导致近似块权重偏低。
+   修法：把 `lengths` 折进 `p_ap` 再做 matmul（分子分母同尺度）。修完
+   tau=1.3 的 PSNR 从 31.62 → **34.92 dB**（+3.3 dB）。
+4. 附带修掉一个尺寸 bug：`|start_m - blk| <= LOCAL` 把 BLOCK_M(64) 与
+   BLOCK_N(128) 混在一个单位里比较，改成 `qb_kv = start_m*BLOCK_M//BLOCK_N`。
+
+**做法**：新增独立 kernel `_vc_attn_fwd_sparse`（稠密 kernel 一字未动，G2 天然成立），
+按 Sol 的结构走——每 `GROUP=16` 个 KV block 一组：
+- 一次 tensor-core matmul `q @ kc^T` 得到整组的逐行代理分；
+- 行均值与主机侧阈值比较；
+- 被跳过的 block 用**一次小 matmul** `p_ap @ vc`（块均值 V，长度已折入）折进来；
+- 被保留的 block 用 `_vc_exact_tile` 逐个精确算（与稠密 kernel 同一段代码，
+  避免漂移）。
+
+### Phase 3 实测
+
+**门 G2（无回归）** ✅ `_probe33`：LOCAL=1e5 / SINK=1e5 / tau=-1000 三种强制全保留
+都与 SPARSE=False **逐元素相同**（rel-err 0.000e+00）。
+
+**门 G3（路由正确）** ✅ `_probe35`：与独立 PyTorch 仿真（同样的量化算子 +
+同样的「块均值 V / 复用 proxy」近似）在四个 tau 下 PSNR 差 ≤0.01 dB：
+| tau | keep | 仿真 | kernel |
+|---|---|---|---|
+| 0.8 | 0.230 | 36.73 | 36.72 |
+| 1.0 | 0.178 | 36.12 | 36.12 |
+| 1.3 | 0.119 | 35.46 | 35.47 |
+| 2.0 | 0.046 | 34.82 | 34.83 |
+（rel-err 7–9e-2；1e-3 那个目标不现实——kernel 的近似路径是 bf16 matmul，
+仿真 是 fp32。PSNR 一致到 0.01 dB 才是有意义的判据。）
+
+**门 G4（快于 Kitchen）** ✅（64K）/ ⚠️（16K）：
+| tokens | bf16 SDPA | Kitchen INT8 | VC 稠密 | **VC 稀疏 tau=1.3** |
+|---|---|---|---|---|
+| 16384 | 35.4 ms | 13.45 ms | 32.9 ms | **15.0 ms**（0.90× Kitchen） |
+| 65536 | 559 ms | 202.1 ms | 432 ms | **112.3 ms**（**1.80× Kitchen**，4.98× SDPA） |
+
+原投影「64K ~105 ms / ~5.3× SDPA」→ 实测 112 ms / 4.98×，**投影准确**。
+
+**门 G5（tau–速度–PSNR 曲线）**：见上表 + probe35 输出的四个 tau 点。
+
+### Phase 4 — 完成 ✅
+
+节点新增 `enable_sparsity`(True) / `tau`(1.3) / `sparsity_min_tokens`(8192) /
+`sink_tokens`(512) / `local_blocks`(1)；`apply()` 打印稀疏配置。
+`override_priority` 默认由 `defer` 改为 **`front`**（依据：64K 实测 1.80× 快于 Kitchen；
+16K 慢 11%，README 写明）。
+
+### 质量门 — **未通过，且在这块数据上无法通过** ⚠️（如实汇报）
+
+- 合成 `h3_like` 上，稀疏相对稠密掉 ~20 dB，**任何 tau 都超 3 dB 底线**。
+- 但这不是本 port 的问题：**独立的 fp32 Sol 仿真（probe22 的规则）在同一数据上只有
+  31.8 dB，比本 kernel（35.5 dB）更差**。原因是合成数据的 K 在 128-token block 内
+  近乎正交，块均值 proxy 代表不了块内 token —— 算法前提不成立。
+- **结论：合成 PSNR 不能用来判定稀疏的质量损失。** 真正的门是端到端 H3 出图对比，
+  pod 上有完整 H3 权重（`models/diffusion_models/minimax_h3_*`），但需要搭一个可跑
+  的工作流 + 重启 ComfyUI 载入新节点，本次未做。
+- **未做的事**：没有为了让数字好看而调参；没有隐瞒这个负结果。
+
+### 下一步（留给下次）
+
+1. **端到端质量验证**（唯一未过的门）：搭 H3 最小工作流，dense vs sparse 出图对比，
+   再决定 `enable_sparsity` 默认值是否保持 True。
+2. probe30 的 `TILE_SKIP` 已随稠密 kernel 恢复原签名（测量专用）。
+3. 若端到端质量可接受，可再考虑 tau 调度（Phase 4 的 `GroupSchedule` 复用）。
+

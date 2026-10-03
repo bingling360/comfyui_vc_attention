@@ -121,6 +121,12 @@ class TritonConfig:
     tau: float = 1.3
     local_blocks: int = 1     # |q_block - kv_block| <= this stays exact
     sink_blocks: int = 0      # first N KV blocks stay exact (H3 conditioning)
+    # KV blocks routed together. One tensor-core matmul yields the per-row
+    # proxy for the whole group, and one small matmul folds every skipped
+    # block's mean-value column in -- that is what keeps the skipped path off
+    # the fp32 elementwise units (see PLAN_sparse_fusion.md section 4). tl.dot
+    # needs every dim >= 16, so this cannot go below 16.
+    group: int = 16
 
 
 def _default_pv_fp8() -> bool:
@@ -198,7 +204,6 @@ if _HAS_TRITON:
     def _vc_attn_fwd(
         Q, QS, K, KS, V, VS, MU, Out,
         Q4, Q4S, K4, K4S,           # NVFP4 Q/K (only read when QK_FP4)
-        KMEAN, VMEAN, THRESH,       # block routing (only read when SPARSE)
         sm_scale,
         N,                          # true token count (masks)
         N_PAD,                      # padded token count (loop bound, strides)
@@ -209,9 +214,6 @@ if _HAS_TRITON:
         BETA: tl.constexpr,
         PV_FP8: tl.constexpr,
         QK_FP4: tl.constexpr,
-        SPARSE: tl.constexpr = False,
-        LOCAL: tl.constexpr = 1,
-        SINK: tl.constexpr = 0,
         TILE_SKIP: tl.constexpr = 1,
     ):
         start_m = tl.program_id(0)
@@ -246,105 +248,253 @@ if _HAS_TRITON:
 
         # TILE_SKIP > 1 walks only every TILE_SKIP-th KV tile. It produces a
         # WRONG result -- it exists to measure how kernel time scales with the
-        # number of tiles, i.e. the ceiling for Sol-Attn-style block sparsity.
+        # number of tiles, i.e. the ceiling for Sol-Attn-style block sparsity
+        # (tests/_probe30_tilescale.py). Block sparsity itself lives in the
+        # separate _vc_attn_fwd_sparse kernel below.
         for start_n in range(0, N_PAD, BLOCK_N * TILE_SKIP):
             offs_n = start_n + tl.arange(0, BLOCK_N)
             nmask = offs_n < N
             blk = start_n // BLOCK_N
 
-            # ---- Sol-Attn block routing -------------------------------------
-            # proxy = <q, mean_k(block)> * scale, compared against a per
-            # (query-block, head) threshold precomputed host-side. `keep` must be
-            # a program-level scalar so the whole tile can be skipped -- that is
-            # where the time saving comes from. Local neighbours and sink blocks
-            # stay exact.
-            proxy = tl.zeros([BLOCK_M], dtype=tl.float32)
-            if SPARSE:
-                km = tl.load(KMEAN + off_bh.to(tl.int64) * nb * D + blk * D + offs_d)
-                proxy = tl.sum(q.to(tl.float32) * km[None, :], axis=1) * sm_scale
-                thr = tl.load(THRESH + off_bh * (N_PAD // BLOCK_M) + start_m)
-                keep = (tl.sum(proxy, axis=0) / BLOCK_M > thr) \
-                    | (tl.abs(start_m - blk) <= LOCAL) | (blk < SINK)
-            else:
-                keep = True
+            v = tl.load(V + base + offs_n[:, None] * D + offs_d[None, :],
+                        mask=nmask[:, None], other=0.0)
 
-            if keep:
-                v = tl.load(V + base + offs_n[:, None] * D + offs_d[None, :],
+            # ---- scores -----------------------------------------------------
+            if QK_FP4:
+                kpk = tl.load(K4 + off_bh.to(tl.int64) * (D // 2) * N_PAD
+                              + offs_dp[:, None] * N_PAD + offs_n[None, :],
+                              mask=nmask[None, :], other=0)
+                ksc = tl.load(K4S + off_bh.to(tl.int64) * N_PAD * (D // 16)
+                              + offs_n[:, None] * (D // 16) + offs_dg[None, :],
+                              mask=nmask[:, None], other=0).to(tl.float8e4nv, bitcast=True)
+                s = tl.dot_scaled(qpk, qsc, "e2m1", kpk, ksc, "e2m1", out_dtype=tl.float32)
+                s = s * sm_scale
+            else:
+                # fp8 x fp8 -> fp32, then the per-token scales
+                k = tl.load(K + base + offs_n[:, None] * D + offs_d[None, :],
                             mask=nmask[:, None], other=0.0)
+                ks = tl.load(KS + off_bh * N_PAD + offs_n, mask=nmask, other=0.0)
+                s = tl.dot(q, tl.trans(k))
+                s = s * (qs[:, None] * ks[None, :]) * sm_scale
+            s = tl.where(nmask[None, :], s, -1.0e30)
 
-                # ---- scores -------------------------------------------------
-                if QK_FP4:
-                    kpk = tl.load(K4 + off_bh.to(tl.int64) * (D // 2) * N_PAD
-                                  + offs_dp[:, None] * N_PAD + offs_n[None, :],
-                                  mask=nmask[None, :], other=0)
-                    ksc = tl.load(K4S + off_bh.to(tl.int64) * N_PAD * (D // 16)
-                                  + offs_n[:, None] * (D // 16) + offs_dg[None, :],
-                                  mask=nmask[:, None], other=0).to(tl.float8e4nv, bitcast=True)
-                    s = tl.dot_scaled(qpk, qsc, "e2m1", kpk, ksc, "e2m1", out_dtype=tl.float32)
-                    s = s * sm_scale
-                else:
-                    # fp8 x fp8 -> fp32, then the per-token scales
-                    k = tl.load(K + base + offs_n[:, None] * D + offs_d[None, :],
-                                mask=nmask[:, None], other=0.0)
-                    ks = tl.load(KS + off_bh * N_PAD + offs_n, mask=nmask, other=0.0)
-                    s = tl.dot(q, tl.trans(k))
-                    s = s * (qs[:, None] * ks[None, :]) * sm_scale
-                s = tl.where(nmask[None, :], s, -1.0e30)
+            m_new = tl.maximum(m_i, tl.max(s, 1))
+            m_new = tl.where(m_new == float("-inf"), 0.0, m_new)
+            alpha = tl.math.exp2((m_i - m_new) * LOG2E)
+            alpha = tl.where(m_i == float("-inf"), 0.0, alpha)
 
-                m_new = tl.maximum(m_i, tl.max(s, 1))
-                m_new = tl.where(m_new == float("-inf"), 0.0, m_new)
-                alpha = tl.math.exp2((m_i - m_new) * LOG2E)
-                alpha = tl.where(m_i == float("-inf"), 0.0, alpha)
-
-                if EXPCAST:
-                    # Write the E4M3 byte directly: one FMA, one round, one clip.
-                    u = (s - m_new[:, None]) * LOG2E + 8.0
-                    code = u * 8.0 + (56.0 + BETA)
-                    code = tl.maximum(tl.minimum(code, 120.0), 0.0)
-                    code_i = code.to(tl.int32).to(tl.uint8)
-                    p8 = code_i.to(tl.float8e4nv, bitcast=True)
-                else:
-                    p8 = (tl.math.exp2((s - m_new[:, None]) * LOG2E) * P_SCALE).to(tl.float8e4nv)
-
-                r = tl.sum(p8.to(tl.float32), 1) / P_SCALE
-
-                # ---- PV with the per-block scale, then restore the block mean
-                # fp8 PV (E4M3 x E4M3 -> fp32) on parts where the register-
-                # operand fp8 dot is correct: that doubles the MMA rate vs bf16
-                # at identical precision, since both operands are already E4M3.
-                # On sm_89 the register fp32->e4m3 conversion is broken
-                # (probe14/15/16), so there the bf16 dot is used (E4M3 -> bf16
-                # is exact, so the arithmetic is unchanged, at half the rate).
-                if PV_FP8:
-                    tile = tl.dot(p8, v)
-                else:
-                    tile = tl.dot(p8.to(tl.bfloat16), v.to(tl.bfloat16))
-                vs = tl.load(VS + off_bh * nb * D + blk * D + offs_d)
-                mu = tl.load(MU + off_bh * nb * D + blk * D + offs_d)
-
-                acc = acc * alpha[:, None]
-                acc += tile * (vs[None, :] / P_SCALE)
-                # MU stores mean/v_scale (test_prepare asserts mu * v_scale ==
-                # mean), so the restoration needs both factors.
-                acc += r[:, None] * (mu[None, :] * vs[None, :])
-                l_i = l_i * alpha + r
-                m_i = m_new
+            if EXPCAST:
+                # Write the E4M3 byte directly: one FMA, one round, one clip.
+                u = (s - m_new[:, None]) * LOG2E + 8.0
+                code = u * 8.0 + (56.0 + BETA)
+                code = tl.maximum(tl.minimum(code, 120.0), 0.0)
+                code_i = code.to(tl.int32).to(tl.uint8)
+                p8 = code_i.to(tl.float8e4nv, bitcast=True)
             else:
-                # Skipped block: approximate it from its proxy rather than
-                # dropping it (Sol-Attn's "reuse below-threshold score
-                # columns"). Every column is treated as scoring `proxy`, so the
-                # tile adds BLOCK_N * v_mean to the numerator and BLOCK_N * p to
-                # the denominator. K and V are never loaded.
-                vm = tl.load(VMEAN + off_bh.to(tl.int64) * nb * D + blk * D + offs_d)
-                m_new = tl.maximum(m_i, proxy)
+                p8 = (tl.math.exp2((s - m_new[:, None]) * LOG2E) * P_SCALE).to(tl.float8e4nv)
+
+            r = tl.sum(p8.to(tl.float32), 1) / P_SCALE
+
+            # ---- PV with the per-block scale, then restore the block mean
+            # fp8 PV (E4M3 x E4M3 -> fp32) on parts where the register-
+            # operand fp8 dot is correct: that doubles the MMA rate vs bf16
+            # at identical precision, since both operands are already E4M3.
+            # On sm_89 the register fp32->e4m3 conversion is broken
+            # (probe14/15/16), so there the bf16 dot is used (E4M3 -> bf16
+            # is exact, so the arithmetic is unchanged, at half the rate).
+            if PV_FP8:
+                tile = tl.dot(p8, v)
+            else:
+                tile = tl.dot(p8.to(tl.bfloat16), v.to(tl.bfloat16))
+            vs = tl.load(VS + off_bh * nb * D + blk * D + offs_d)
+            mu = tl.load(MU + off_bh * nb * D + blk * D + offs_d)
+
+            acc = acc * alpha[:, None]
+            acc += tile * (vs[None, :] / P_SCALE)
+            # MU stores mean/v_scale (test_prepare asserts mu * v_scale ==
+            # mean), so the restoration needs both factors.
+            acc += r[:, None] * (mu[None, :] * vs[None, :])
+            l_i = l_i * alpha + r
+            m_i = m_new
+
+        acc = acc / l_i[:, None]
+        tl.store(Out + base + offs_m[:, None] * D + offs_d[None, :],
+                 acc.to(Out.dtype.element_ty), mask=offs_m[:, None] < N)
+
+    @triton.jit
+    def _vc_exact_tile(
+        q, qs, off_bh, start_n, base, n_pad, nb,
+        K, KS, V, VS, MU,
+        acc, l_i, m_i,
+        N, sm_scale,
+        D: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        EXPCAST: tl.constexpr,
+        BETA: tl.constexpr,
+        PV_FP8: tl.constexpr,
+    ):
+        """One exact (kept) KV tile, quantised fp8 QK + PV.
+
+        Byte-for-byte the body of the dense loop's kept branch; factored out so
+        the grouped sparse kernel and the dense kernel cannot drift.
+        """
+        offs_d = tl.arange(0, D)
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        nmask = offs_n < N
+        blk = start_n // BLOCK_N
+
+        v = tl.load(V + base + offs_n[:, None] * D + offs_d[None, :],
+                    mask=nmask[:, None], other=0.0)
+        k = tl.load(K + base + offs_n[:, None] * D + offs_d[None, :],
+                    mask=nmask[:, None], other=0.0)
+        ks = tl.load(KS + off_bh * n_pad + offs_n, mask=nmask, other=0.0)
+        s = tl.dot(q, tl.trans(k))
+        s = s * (qs[:, None] * ks[None, :]) * sm_scale
+        s = tl.where(nmask[None, :], s, -1.0e30)
+
+        m_new = tl.maximum(m_i, tl.max(s, 1))
+        m_new = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.math.exp2((m_i - m_new) * LOG2E)
+        alpha = tl.where(m_i == float("-inf"), 0.0, alpha)
+
+        if EXPCAST:
+            u = (s - m_new[:, None]) * LOG2E + 8.0
+            code = u * 8.0 + (56.0 + BETA)
+            code = tl.maximum(tl.minimum(code, 120.0), 0.0)
+            code_i = code.to(tl.int32).to(tl.uint8)
+            p8 = code_i.to(tl.float8e4nv, bitcast=True)
+        else:
+            p8 = (tl.math.exp2((s - m_new[:, None]) * LOG2E) * P_SCALE).to(tl.float8e4nv)
+        r = tl.sum(p8.to(tl.float32), 1) / P_SCALE
+
+        if PV_FP8:
+            tile = tl.dot(p8, v)
+        else:
+            tile = tl.dot(p8.to(tl.bfloat16), v.to(tl.bfloat16))
+        vs = tl.load(VS + off_bh * nb * D + blk * D + offs_d)
+        mu = tl.load(MU + off_bh * nb * D + blk * D + offs_d)
+
+        acc = acc * alpha[:, None]
+        acc += tile * (vs[None, :] / P_SCALE)
+        acc += r[:, None] * (mu[None, :] * vs[None, :])
+        l_i = l_i * alpha + r
+        m_i = m_new
+        return acc, l_i, m_i
+
+    @triton.jit
+    def _vc_attn_fwd_sparse(
+        Q, QS, K, KS, V, VS, MU, Out,
+        KMEAN, VMEAN, THRESH,
+        sm_scale,
+        N,
+        N_PAD,
+        D: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        EXPCAST: tl.constexpr,
+        BETA: tl.constexpr,
+        PV_FP8: tl.constexpr,
+        LOCAL: tl.constexpr = 1,
+        SINK: tl.constexpr = 0,
+        GROUP: tl.constexpr = 16,
+    ):
+        """VC-Attention with Sol-Attn-style block routing fused in.
+
+        Structure follows ``sol_kernel/fwd.py``: KV blocks are walked GROUP at a
+        time so that
+
+          * the routing proxy is ONE tensor-core matmul ``q @ kc^T`` producing a
+            per-row score per block (never a per-tile fp32 elementwise reduce --
+            that was the 27% overhead the first attempt paid), and
+          * every skipped block is folded in with ONE small matmul
+            ``p_approx @ vc`` over its block-mean value, instead of a per-tile
+            ``(BLOCK_M, BLOCK_N)`` fp32 outer product (which cost ~45% of the
+            dense kernel and made the skip pointless).
+
+        Blocks below the threshold are *approximated*, not dropped: their proxy
+        score is reused as the score of the block, so the softmax normaliser
+        stays right. Kept blocks run the exact quantised tile.
+
+        The all-kept case (tau very negative) is bit-identical to the dense
+        kernel: the approximate update is skipped when no block is approximate,
+        and exact blocks are visited in increasing order, so the online-softmax
+        sequence is unchanged (tests/_probe33_sparse_isolate.py).
+        """
+        start_m = tl.program_id(0)
+        off_bh = tl.program_id(1)
+
+        offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, D)
+        nb = N_PAD // BLOCK_N
+        base = off_bh.to(tl.int64) * N_PAD * D
+
+        q = tl.load(Q + base + offs_m[:, None] * D + offs_d[None, :],
+                    mask=offs_m[:, None] < N, other=0.0)
+        qs = tl.load(QS + off_bh * N_PAD + offs_m, mask=offs_m < N, other=0.0)
+
+        m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+        l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+        acc = tl.zeros([BLOCK_M, D], dtype=tl.float32)
+
+        thr = tl.load(THRESH + off_bh * (N_PAD // BLOCK_M) + start_m)
+        # The query block's index in KV-block units (BLOCK_M may be < BLOCK_N),
+        # so the local window is compared in one consistent unit.
+        qb_kv = (start_m * BLOCK_M) // BLOCK_N
+
+        for group_start in range(0, N_PAD, BLOCK_N * GROUP):
+            blk0 = group_start // BLOCK_N
+            offs_blk = blk0 + tl.arange(0, GROUP)
+            valid = offs_blk < nb
+
+            # ---- routing proxy: one matmul for the whole group ---------------
+            kc = tl.load(KMEAN + off_bh.to(tl.int64) * nb * D
+                         + offs_blk[:, None] * D + offs_d[None, :],
+                         mask=valid[:, None], other=0.0)
+            proxy = tl.dot(q.to(tl.bfloat16), tl.trans(kc.to(tl.bfloat16)))
+            proxy = proxy * (qs[:, None] * sm_scale)      # (BLOCK_M, GROUP)
+
+            route = (tl.sum(proxy, axis=0) / BLOCK_M > thr) \
+                | (tl.abs(qb_kv - offs_blk) <= LOCAL) | (offs_blk < SINK)
+            exact = valid & route
+            approx = valid & ~route
+
+            # ---- skipped blocks: one rank-GROUP matmul ----------------------
+            if tl.sum(approx.to(tl.int32)) > 0:
+                vc = tl.load(VMEAN + off_bh.to(tl.int64) * nb * D
+                             + offs_blk[:, None] * D + offs_d[None, :],
+                             mask=valid[:, None], other=0.0)
+                s_ap = tl.where(approx[None, :], proxy, -float("inf"))
+                m_new = tl.maximum(m_i, tl.max(s_ap, axis=1))
                 m_new = tl.where(m_new == float("-inf"), 0.0, m_new)
                 alpha = tl.math.exp2((m_i - m_new) * LOG2E)
                 alpha = tl.where(m_i == float("-inf"), 0.0, alpha)
-                p_row = tl.math.exp2((proxy - m_new) * LOG2E)
-                acc = acc * alpha[:, None]
-                acc += p_row[:, None] * (BLOCK_N * vm)[None, :]
-                l_i = l_i * alpha + BLOCK_N * p_row
+                p_ap = tl.math.exp2((s_ap - m_new[:, None]) * LOG2E)
+                p_ap = tl.where(approx[None, :], p_ap, 0.0)
+                # A skipped block stands for its real (possibly tail) length:
+                # every one of those tokens carries the same proxy score and the
+                # same mean value, so the block contributes length * p * v_mean
+                # to the numerator and length * p to the normaliser. Folding the
+                # length in here (rather than only in l_i) is what keeps the
+                # approximation on the same scale as the exact blocks.
+                lengths = tl.where(
+                    valid, tl.minimum(BLOCK_N, N - offs_blk * BLOCK_N), 0
+                ).to(tl.float32)
+                p_ap = p_ap * lengths[None, :]
+                acc = acc * alpha[:, None] + tl.dot(p_ap.to(tl.bfloat16),
+                                                    vc.to(tl.bfloat16))
+                l_i = l_i * alpha + tl.sum(p_ap, axis=1)
                 m_i = m_new
+
+            # ---- kept blocks: exact, in increasing block order --------------
+            exact_offs = tl.where(exact, tl.arange(0, GROUP), GROUP)
+            for _ in range(tl.sum(exact.to(tl.int32))):
+                off = tl.min(exact_offs)
+                exact_offs = tl.where(tl.arange(0, GROUP) == off, GROUP, exact_offs)
+                acc, l_i, m_i = _vc_exact_tile(
+                    q, qs, off_bh, (blk0 + off) * BLOCK_N, base, N_PAD, nb,
+                    K, KS, V, VS, MU, acc, l_i, m_i, N, sm_scale,
+                    D=D, BLOCK_N=BLOCK_N, EXPCAST=EXPCAST, BETA=BETA, PV_FP8=PV_FP8,
+                )
 
         acc = acc / l_i[:, None]
         tl.store(Out + base + offs_m[:, None] * D + offs_d[None, :],
@@ -631,6 +781,13 @@ def vc_attention_triton(
     try:
         qk_fp4 = bool(cfg.qk_fp4) and q.is_cuda
         sparse = bool(cfg.sparse) and q.is_cuda
+        if sparse and qk_fp4:
+            # The sparse kernel only carries the fp8 QK path; NVFP4 QK is an
+            # opt-in side branch that is a measured net loss anyway (see
+            # TritonConfig.qk_fp4), so sparsity wins when both are asked for.
+            print("[VC-Attention] sparse=True disables qk_fp4 (not combined)",
+                  file=sys.stderr)
+            qk_fp4 = False
         if q.is_cuda:
             p = _prepare_fast(q, k, v, perm, block_rows=cfg.block_n,
                               hadamard=True, smooth_k=True, qk_fp4=qk_fp4,
@@ -646,19 +803,34 @@ def vc_attention_triton(
         out = torch.empty((b, h, p.n_pad, d), device=q.device, dtype=q.dtype)
         grid = (triton.cdiv(p.n_pad, cfg.block_m), b * h)
         pv_fp8 = cfg.pv_fp8 if cfg.pv_fp8 is not None else _default_pv_fp8()
+        if sparse:
+            # Grouped sparse kernel: fp8 QK/PV plus block routing. Kept as a
+            # separate kernel so the dense path stays byte-identical (gate G2).
+            _vc_attn_fwd_sparse[grid](
+                p.q, p.q_scale, p.k, p.k_scale, p.v, p.v_scale, p.mu, out,
+                p.k_mean, p.v_mean, p.thresh,
+                scale, n, p.n_pad, d,
+                BLOCK_M=cfg.block_m,
+                BLOCK_N=cfg.block_n,
+                EXPCAST=cfg.enable_expcast,
+                BETA=cfg.expcast_beta,
+                PV_FP8=pv_fp8,
+                LOCAL=cfg.local_blocks,
+                SINK=cfg.sink_blocks,
+                GROUP=cfg.group,
+                num_warps=cfg.num_warps,
+                num_stages=cfg.num_stages,
+            )
+            return out[:, :, :n]
         # When QK_FP4 is off the four fp4 slots are unused; pass the fp8 tensors
         # so the argument list stays uniform (the loads are dead-code-eliminated).
         q4 = p.q4 if qk_fp4 else p.q
         q4s = p.q4_scale if qk_fp4 else p.q_scale
         k4 = p.k4 if qk_fp4 else p.k
         k4s = p.k4_scale if qk_fp4 else p.k_scale
-        kmean = p.k_mean if sparse else p.k
-        vmean = p.v_mean if sparse else p.v
-        thresh = p.thresh if sparse else p.q_scale
         _vc_attn_fwd[grid](
             p.q, p.q_scale, p.k, p.k_scale, p.v, p.v_scale, p.mu, out,
             q4, q4s, k4, k4s,
-            kmean, vmean, thresh,
             scale, n, p.n_pad, d,
             BLOCK_M=cfg.block_m,
             BLOCK_N=cfg.block_n,
@@ -666,9 +838,6 @@ def vc_attention_triton(
             BETA=cfg.expcast_beta,
             PV_FP8=pv_fp8,
             QK_FP4=qk_fp4,
-            SPARSE=sparse,
-            LOCAL=cfg.local_blocks,
-            SINK=cfg.sink_blocks,
             num_warps=cfg.num_warps,
             num_stages=cfg.num_stages,
         )

@@ -65,8 +65,36 @@ class VCAttentionMiniMaxH3:
                 "min_tokens": ("INT", {"default": 8192, "min": 512, "max": 1 << 20, "step": 512,
                                        "tooltip": "Skip VC-Attention below this sequence "
                                                   "length; SDPA is cheaper for short ones."}),
+                "enable_sparsity": ("BOOLEAN",
+                                    {"default": True,
+                                     "tooltip": "Fuse Sol-Attn-style block sparsity into the "
+                                                "kernel: KV blocks below a proxy threshold are "
+                                                "skipped and approximated from their block "
+                                                "mean. This is what makes the node faster than "
+                                                "Comfy Kitchen INT8 (measured 1.8x at 64K "
+                                                "tokens, 5.0x vs bf16 SDPA). Turn it off for "
+                                                "the pure-quantisation path."}),
             },
             "optional": {
+                "tau": ("FLOAT", {"default": 1.3, "min": 0.0, "max": 8.0, "step": 0.1,
+                                  "tooltip": "Sparsity threshold in std-devs above the mean "
+                                             "block proxy (Sol-Attn's tuned value). Larger = "
+                                             "fewer blocks kept = faster, lower quality. "
+                                             "Measured keep ratio: 0.8 -> 23%, 1.0 -> 18%, "
+                                             "1.3 -> 12%, 2.0 -> 5%."}),
+                "sparsity_min_tokens": ("INT", {"default": 8192, "min": 1024, "max": 1 << 20,
+                                                "step": 512,
+                                                "tooltip": "Sparsity only below this length is "
+                                                           "left off; short sequences do not "
+                                                           "amortise the routing."}),
+                "sink_tokens": ("INT", {"default": 512, "min": 0, "max": 8192, "step": 128,
+                                        "tooltip": "Leading tokens kept exact. H3 packs "
+                                                   "text/conditioning at the head of the "
+                                                   "sequence and those rows are "
+                                                   "quality-sensitive."}),
+                "local_blocks": ("INT", {"default": 1, "min": 0, "max": 8,
+                                         "tooltip": "+/-N KV blocks around each query block "
+                                                    "are always kept exact (Sol-Attn uses 1)."}),
                 "group_fraction": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0,
                                              "step": 0.05,
                                              "tooltip": "Fraction of steps that run k-means."}),
@@ -79,17 +107,18 @@ class VCAttentionMiniMaxH3:
                                     "tooltip": "Use the H3 modality tag as the primary sort "
                                                "key. Measured slightly worse than plain label "
                                                "sorting; left off by default."}),
-                "override_priority": (["defer", "front"],
-                                      {"default": "defer",
+                "override_priority": (["front", "defer"],
+                                      {"default": "front",
                                        "tooltip": "What to do when another attention backend "
                                                   "already owns the override chain (Comfy "
-                                                  "Kitchen's backend node, Sol-Attn). 'defer' "
-                                                  "leaves it alone and VC-Attention stays out; "
-                                                  "'front' chains in front so VC-Attention "
-                                                  "takes the calls it supports. Measured on "
-                                                  "sm_120: taking priority over Kitchen INT8 "
-                                                  "is 0.34x (3x SLOWER), so only pick 'front' "
-                                                  "if VC-Attention is your fastest backend."}),
+                                                  "Kitchen's backend node, Sol-Attn). 'front' "
+                                                  "chains in front so VC-Attention takes the "
+                                                  "calls it supports. Measured on sm_120: the "
+                                                  "fused sparse kernel is 1.80x faster than "
+                                                  "Kitchen INT8 at 64K tokens (H3's real "
+                                                  "length) but ~11% slower at 16K. 'defer' "
+                                                  "stays out of the chain entirely (never "
+                                                  "slower, but never faster either)."}),
             },
         }
 
@@ -99,7 +128,13 @@ class VCAttentionMiniMaxH3:
     CATEGORY = CATEGORY
     DESCRIPTION = (
         "Nunchux VC-Attention adapted to MiniMax-H3: V-Smooth value grouping plus "
-        "low-bit QK/PV. Training-free; no checkpoint changes.\n\n"
+        "low-bit QK/PV, with Sol-Attn-style block sparsity fused into the same "
+        "kernel. Training-free; no checkpoint changes.\n\n"
+        "Sparsity skips KV blocks whose block-mean proxy score falls below a "
+        "threshold and approximates them from that block mean, so it multiplies "
+        "with the quantisation instead of competing for it. Measured on an RTX "
+        "5090 at 65536 tokens / 56 heads: 112 ms vs 202 ms for Comfy Kitchen "
+        "INT8 and 559 ms for bf16 FlashAttention (5.0x).\n\n"
         "Speed expectations are architecture-bound: the paper's kernel gains "
         "(1.46-3.6x attention) need Hopper/Blackwell. On RTX 40-series (Ada) this "
         "node is correctness-only - measured ~parity with native SDPA on an RTX "
@@ -115,6 +150,11 @@ class VCAttentionMiniMaxH3:
         total_steps=8,
         block_rows=128,
         min_tokens=8192,
+        enable_sparsity=True,
+        tau=1.3,
+        sparsity_min_tokens=8192,
+        sink_tokens=512,
+        local_blocks=1,
         group_fraction=0.25,
         reuse_every=4,
         kmeans_iters=3,
@@ -132,6 +172,11 @@ class VCAttentionMiniMaxH3:
             enable_expcast=bool(enable_expcast and resolved == "fp8"),
             block_rows=int(block_rows),
             min_tokens=int(min_tokens),
+            enable_sparsity=bool(enable_sparsity),
+            tau=float(tau),
+            sparsity_min_tokens=int(sparsity_min_tokens),
+            sink_tokens=int(sink_tokens),
+            local_blocks=int(local_blocks),
             kmeans_iters=int(kmeans_iters),
             modality_aware=bool(modality_aware),
             group_fraction=float(group_fraction),
@@ -149,6 +194,9 @@ class VCAttentionMiniMaxH3:
             f"expcast={cfg.enable_expcast} block_rows={cfg.block_rows} "
             f"grouping on steps 0..{max(0, runtime.schedule.group_steps(total_steps) - 1)} "
             f"of {total_steps}\n"
+            f"[VC-Attention] sparsity={cfg.enable_sparsity} tau={cfg.tau} "
+            f"(on from {cfg.sparsity_min_tokens} tokens; sink {cfg.sink_tokens}, "
+            f"local +/-{cfg.local_blocks} blocks)\n"
             f"[VC-Attention] {status}\n"
             f"[VC-Attention] {profile.expectation_note()}"
         )

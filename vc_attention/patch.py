@@ -69,6 +69,28 @@ class VCAttentionConfig:
     hadamard: bool = True
     smooth_k: bool = True
 
+    # --- Sol-Attn-style block sparsity, fused into the kernel ----------------
+    # Skipped KV blocks are not dropped: their block-mean proxy score is reused
+    # as the score of the whole block against the block-mean value, so the
+    # softmax normaliser stays right. See PLAN_sparse_fusion.md.
+    #
+    # Measured on sm_120 (tests/_probe35_phase3.py, 56 heads, D=128), fused
+    # sparse vs the alternatives:
+    #   16384 tokens: SDPA 35.4 | Kitchen INT8 13.3 | VC dense 32.9 |
+    #                 VC sparse tau=1.3 15.0 | tau=2.0 12.7 ms
+    #   65536 tokens: SDPA 558  | Kitchen INT8 203  | VC dense 433  |
+    #                 VC sparse tau=1.3 112  | tau=2.0 75 ms
+    # So the fused version is the fastest backend for H3's real (~63K token)
+    # workload; at 16K it is at parity with Kitchen.
+    enable_sparsity: bool = True
+    tau: float = 1.3
+    # Below this length sparsity is off (and VC-Attention may not run at all).
+    sparsity_min_tokens: int = 8192
+    # The first sink_tokens tokens stay exact: H3 packs text/conditioning at the
+    # head of the sequence and those rows are quality-sensitive.
+    sink_tokens: int = 512
+    local_blocks: int = 1            # +-N KV blocks around the query block exact
+
     # grouping
     kmeans_iters: int = 3
     warm_iters: int = 2
@@ -86,15 +108,19 @@ class VCAttentionConfig:
     # What to do when another backend already owns
     # transformer_options["optimized_attention_override"] -- Comfy Kitchen's
     # backend node, or Sol-Attn's generic node:
-    #   "defer" -> leave it alone and stay out of the chain (default)
+    #   "defer" -> leave it alone and stay out of the chain
     #   "front" -> chain in front, so VC-Attention handles the calls it supports
     #             and the other backend gets the rest
-    # Measured on sm_120 (tests/_probe27_stack_gain.py, 16384 tokens, 56 heads):
-    #   Kitchen alone 13.4 ms | VC in front 39.6 ms (0.34x) | Kitchen in front 13.6 ms
-    # VC-Attention's kernel is the slowest of the three, so "front" is a 3x
-    # REGRESSION unless VC-Attention is genuinely the fastest backend you have.
-    # "front" only makes sense once the kernel is competitive.
-    override_priority: str = "defer"
+    # Measured on sm_120, 56 heads, D=128 (tests/_probe35_phase3.py,
+    # tests/_probe26_kitchen_time.py):
+    #   16384 tokens: Kitchen 13.45 ms | VC sparse tau=1.3 15.00 ms (0.90x)
+    #   65536 tokens: Kitchen 202.1 ms | VC sparse tau=1.3 112.3 ms (1.80x)
+    # The fused sparse kernel is the fastest backend in H3's real (~63K token)
+    # regime and only ~11% behind Kitchen at 16K, so "front" is now the default
+    # -- that is what makes the node actually take effect next to a Kitchen
+    # backend node. Set "defer" if you work at short sequence lengths, or if you
+    # want a non-VC backend to keep ownership unconditionally.
+    override_priority: str = "front"
 
     supported_head_dims: tuple = (64, 128)
 
@@ -231,6 +257,13 @@ class VCAttentionRuntime:
             # depends on the sequence shape; see tests/bench_pv.py.
             pv_fp8=(True if self.backend == "nvfp4" else None),
             qk_fp4=(self.backend == "nvfp4"),
+            # Block sparsity: only for sequences long enough to pay for it, and
+            # never on the pure-PyTorch reference backend (which has no routing
+            # statistics and would be slower than SDPA anyway).
+            sparse=bool(cfg.enable_sparsity and n >= cfg.sparsity_min_tokens),
+            tau=cfg.tau,
+            local_blocks=cfg.local_blocks,
+            sink_blocks=max(0, int(cfg.sink_tokens) // max(1, cfg.block_rows)),
         )
         return vc_attention_triton(q, k, v, perm=perm, cfg=tcfg, scale=scale)
 
@@ -325,10 +358,11 @@ def install_attention_override(runtime: "VCAttentionRuntime", model: Any,
     Whether that is *worth* doing depends on VC-Attention being the faster
     backend, so ``priority`` (default ``config.override_priority``) decides:
 
-      * ``"defer"`` (default) -- if another backend is already installed, leave
-        it alone and do not enter the chain. Measured on sm_120 this is the
-        right call: Kitchen INT8 does 13.4 ms where we do 39.6 ms.
-      * ``"front"`` -- chain in front and take the calls VC-Attention supports.
+      * ``"front"`` (default) -- chain in front and take the calls VC-Attention
+        supports. Correct now that the fused sparse kernel beats Comfy Kitchen
+        INT8 at H3's sequence length (1.80x at 64K); at 16K it is ~11% behind.
+      * ``"defer"`` -- if another backend is already installed, leave it alone
+        and do not enter the chain. Pick this for short-sequence work.
 
     Returns True when the chain entry was installed.
     """
@@ -344,9 +378,9 @@ def install_attention_override(runtime: "VCAttentionRuntime", model: Any,
         _notify_once(
             "another attention backend already owns attention "
             "(`optimized_attention_override`) -> VC-Attention stays out. Set "
-            "override_priority='front' to take priority instead, but only if "
-            "VC-Attention is the fastest backend you have (measured: taking "
-            "priority over Comfy Kitchen INT8 is 0.34x, i.e. 3x slower)."
+            "override_priority='front' to take priority instead; the fused "
+            "sparse kernel beats Comfy Kitchen INT8 at H3's sequence length "
+            "(1.80x at 64K tokens) but is ~11% behind it at 16K."
         )
         return False
 
