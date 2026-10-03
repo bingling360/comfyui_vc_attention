@@ -35,7 +35,7 @@ from .schedule import GroupSchedule, PermutationCache, StepTracker
 
 __all__ = [
     "VCAttentionConfig", "VCAttentionRuntime", "get_runtime",
-    "install", "uninstall", "is_installed",
+    "install", "uninstall", "is_installed", "install_attention_override",
 ]
 
 _ORIGINALS: Dict[str, Callable] = {}
@@ -262,6 +262,83 @@ def get_runtime() -> VCAttentionRuntime:
 # Installation
 # ---------------------------------------------------------------------------
 
+def _try_vc(runtime: "VCAttentionRuntime", q, k, v, heads: int, mask=None,
+            skip_reshape: bool = False, skip_output_reshape: bool = False, **kwargs):
+    """Run VC-Attention on a comfy-style attention call, or return None.
+
+    Shared by the ``optimized_attention`` monkey-patch and the
+    ``optimized_attention_override`` chain entry so the two cannot drift.
+    """
+    if not runtime.config.enabled or mask is not None:
+        return None
+    if not (isinstance(q, torch.Tensor) and isinstance(k, torch.Tensor)
+            and isinstance(v, torch.Tensor)):
+        return None
+
+    if q.dim() == 4:
+        b, h_, s_, d_ = q.shape
+        out = runtime.attention(q, k, v)
+        if out is None:
+            return None
+        return out if skip_output_reshape else out.transpose(1, 2).reshape(b, s_, h_ * d_)
+
+    if q.dim() != 3 or heads <= 0 or q.shape[-1] % heads:
+        return None
+    b, n, inner = q.shape
+    d = inner // heads
+    q4 = q.view(b, n, heads, d).transpose(1, 2)
+    k4 = k.view(k.shape[0], k.shape[1], heads, d).transpose(1, 2)
+    v4 = v.view(v.shape[0], v.shape[1], heads, d).transpose(1, 2)
+    out = runtime.attention(q4, k4, v4)
+    if out is None:
+        return None
+    return out if skip_output_reshape else out.transpose(1, 2).reshape(b, n, heads * d)
+
+
+def install_attention_override(runtime: "VCAttentionRuntime", model: Any) -> bool:
+    """Register VC-Attention in ComfyUI's ``optimized_attention_override`` chain.
+
+    Monkey-patching ``optimized_attention`` puts VC-Attention *outside* the
+    dispatch, so any node that registers an override (Comfy Kitchen's backend
+    node, Sol-Attn's generic node) wins and VC-Attention is silently inactive
+    (measured: tests/_probe21_kitchen.py). Entering the chain instead makes the
+    two compose, with node order deciding priority -- exactly how Sol-Attn
+    chains whatever override was already installed:
+
+        prev = transformer_options["optimized_attention_override"]
+        new  = lambda func, *a, **kw: vc(a, kw) or (prev or func)(func, *a, **kw)
+
+    Returns True when the chain entry was installed.
+    """
+    try:
+        opts = model.model_options["transformer_options"]
+    except Exception:
+        return False
+
+    prev = opts.get("optimized_attention_override")
+
+    def override(func, *args, **kwargs):
+        try:
+            out = _try_vc(runtime, *args, **kwargs)
+        except Exception as e:  # never take a run down
+            _notify_once(f"override deferring after {type(e).__name__}: {e}")
+            out = None
+        if out is not None:
+            return out
+        return prev(func, *args, **kwargs) if prev is not None else func(*args, **kwargs)
+
+    if prev is not None:
+        override._vc_prev = prev                       # type: ignore[attr-defined]
+    opts["optimized_attention_override"] = override
+    _ORIGINALS["override"] = (opts, prev, override)
+    _notify_once(
+        "registered in the attention-override chain"
+        + (" (chained in front of an existing backend)" if prev is not None
+           else "")
+    )
+    return True
+
+
 def _make_hook(runtime: VCAttentionRuntime, orig: Callable) -> Callable:
     @functools.wraps(orig)
     def hooked(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
@@ -322,12 +399,15 @@ def install(config: Optional[VCAttentionConfig] = None, model: Any = None) -> VC
                         # *outside* that chain, so it always loses -- say so,
                         # because otherwise the node looks enabled and does
                         # nothing. Measured: tests/_probe21_kitchen.py.
-                        _notify_once(
-                            "another attention backend is active "
-                            "(`optimized_attention_override`: Comfy Kitchen or "
-                            "Sol-Attn) -> VC-Attention is INACTIVE for those "
-                            "calls. Remove that node, or disable VC-Attention."
-                        )
+                        if "override" not in _ORIGINALS:
+                            # Not in the chain ourselves -> we really are shadowed.
+                            _notify_once(
+                                "another attention backend is active "
+                                "(`optimized_attention_override`: Comfy Kitchen or "
+                                "Sol-Attn) and VC-Attention is not in the chain -> "
+                                "VC-Attention is INACTIVE. Pass model= to install() "
+                                "to chain in, or remove that node."
+                            )
                         return orig(q, k, v, heads, *args, **kwargs)
 
                     if _ATTN_CONTAINER is not None and isinstance(q, _ATTN_CONTAINER):
@@ -341,24 +421,10 @@ def install(config: Optional[VCAttentionConfig] = None, model: Any = None) -> VC
                             and isinstance(v, torch.Tensor)):
                         return orig(q, k, v, heads, *args, **kwargs)
 
-                    if q.dim() == 4:
-                        # skip_reshape=True callers (MiniMax-H3 among them) pass
-                        # (B, heads, S, D) already split.
-                        b, h_, s_, d_ = q.shape
-                        out = runtime.attention(q, k, v)
-                        if out is None:
-                            return orig(q, k, v, heads, *args, **kwargs)
-                        return out.transpose(1, 2).reshape(b, s_, h_ * d_)
-
-                    b, n, _ = q.shape
-                    d = q.shape[-1] // heads
-                    q4 = q.view(b, n, heads, d).transpose(1, 2)
-                    k4 = k.view(k.shape[0], k.shape[1], heads, d).transpose(1, 2)
-                    v4 = v.view(v.shape[0], v.shape[1], heads, d).transpose(1, 2)
-                    out = runtime.attention(q4, k4, v4)
+                    out = _try_vc(runtime, q, k, v, heads, *args, **kwargs)
                     if out is None:
                         return orig(q, k, v, heads, *args, **kwargs)
-                    return out.transpose(1, 2).reshape(b, n, heads * d)
+                    return out
                 except Exception as e:
                     # The hook must never take sampling down with it. peek()
                     # consumed nothing, so orig is always callable here — but
@@ -373,6 +439,7 @@ def install(config: Optional[VCAttentionConfig] = None, model: Any = None) -> VC
         pass
 
     if model is not None:
+        install_attention_override(runtime, model)
         _install_step_counter(model, runtime)
     return runtime
 
@@ -438,6 +505,15 @@ def _rebind_by_value_imports(orig: Callable, hooked: Callable) -> None:
 
 def uninstall() -> None:
     """Restore every patched callable."""
+    entry = _ORIGINALS.pop("override", None)
+    if entry is not None:
+        opts, prev, ours = entry
+        # Only unwind if nothing chained on top of us since.
+        if opts.get("optimized_attention_override") is ours:
+            if prev is None:
+                opts.pop("optimized_attention_override", None)
+            else:
+                opts["optimized_attention_override"] = prev
     if "sdpa" in _ORIGINALS:
         torch.nn.functional.scaled_dot_product_attention = _ORIGINALS.pop("sdpa")
     if "sdpa_torch" in _ORIGINALS:

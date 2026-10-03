@@ -232,6 +232,35 @@ Verified here on CPU (torch 2.14, `tests/`, 73 assertions):
   and roughly a third of kernel time being softmax/epilogue, ~1.4–1.5× kernel
   is the ceiling here — consistent with what we measure.
 
+- **Head-to-head against the alternatives already on this machine.** Same
+  harness, same data (`tests/_probe23/26`), 56 heads, D=128, RTX 5090:
+
+  | tokens | bf16 FlashAttention | Comfy Kitchen INT8 | VC-Attention fp8 |
+  |---|---|---|---|
+  | 16384 | 35.09 ms (1.00×) | **13.32 ms (2.63×)** | 32.49 ms (1.08×) |
+  | 65536 | 555.2 ms (1.00×) | **203.0 ms (2.74×)** | 431.5 ms (1.29×) |
+
+  and on fidelity at 16K: Kitchen **68.54 dB** vs VC-Attention **56.43 dB**.
+
+  So on sm_120 this node is beaten on *both* axes by ComfyUI's own INT8 backend
+  — which is already installed. Its kernel sustains ~600 TFLOP/s where ours
+  reaches ~317, and it does not pay for V-Smooth's epilogue or the k-means
+  permutation. **The fp8 path here uses no FP4 at all**, so "it works, it is
+  just modest" is really "it is not competitive": the paper's case for
+  workstation Blackwell is the 4-bit path, and that is the part that does not
+  survive on this stack. Treat this port on sm_120 as a correctness reference,
+  not a speedup — and use Kitchen or Sol-Attn for actual sampling.
+
+- **Composing with other backends.** Monkey-patching `optimized_attention` puts
+  this node *outside* ComfyUI's dispatch, so any node registering an
+  `optimized_attention_override` (Kitchen's backend node, Sol-Attn's generic
+  node) silently shadowed it — measured in `tests/_probe21_kitchen.py`. Passing
+  `model=` to `install()` now also enters that chain, wrapping whatever was
+  already there as the fallback, exactly as Sol-Attn does. VC-Attention then
+  handles the calls it supports and defers the rest (short sequences, other
+  head dims) to the other backend; node order decides priority. Verified in
+  `tests/_probe25_chain.py`.
+
 - **NVFP4 for attention: works, but does not pay off on sm_120.** `tl.dot_scaled`
   with e2m1 + per-16 e4m3 microscales *is* native FP4 hardware on sm_120, not
   emulation — in a compute-bound GEMM (K=4096) it runs at **530 TFLOP/s vs 277
